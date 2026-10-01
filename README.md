@@ -1,13 +1,13 @@
-# muse-guardian
+# hatch-keepalive
 
-给 Muse.ai 沙盒装上探针、Hermes、保活和重建脚本，以及 **MuseAutoApprove**（自动允许审批）的 SKILL。
+给沙盒环境装上探针、Telegram 网关机器人、保活和重建脚本，以及 **MuseAutoApprove**（自动允许审批）的 SKILL。
 
 
 ## 使用
 
 
 ```
-帮我安装 `https://raw.githubusercontent.com/bytehola/muse-guardian/refs/heads/main/SKILL.md`并开始执行。
+帮我安装 `https://raw.githubusercontent.com/andyliu/hatch-keepalive/refs/heads/main/SKILL.md`并开始执行。
 ```
 
 如遇拦截，打开侧边栏点击新旁路会话发送。

@@ -1,7 +1,7 @@
 ---
 name: muse-guardian
-description: "在全新沙盒/新账号上从零部署一套「CF Server Monitor 探针 + 三层保活 + Hermes 微信机器人 + MuseAutoApprove（muse.ai 外联审批自动批准）」：Cloudflare Worker 后台、cf-probe 探针、持久化脚本布局、离线包缓存、Hermes 安装与模型 API 配置、微信扫码绑定、沙盒内看门狗、平台 hook 探针（检测/恢复拆分）、平台开机钩子、端到端验证。开工先问「全部安装 / 逐模块」（默认逐模块）；全文按 5 个模块 + 收尾组织，同一模块内连续执行，只在用户必须输入/扫码/平台点击时打断；每步五段式（命令 / 话术 / 用户手动动作 / 做完的标志 / 排错表格），全部脚本完整代码直接内嵌，复制即可用。触发词：部署保活、给新账号也来一套、装探针、微信机器人、沙盒重建恢复、保活脚本、自动审批、审批卡片、MuseAutoApprove。"
-version: 2.6.0
+description: "在全新沙盒/新账号上从零部署一套「CF Server Monitor 探针 + 三层保活 + Hermes Telegram 网关 + muse-bridge 模型桥接（Muse 自己当大脑，Hermes 只当手）+ MuseAutoApprove（muse.ai 外联审批自动批准）」：Cloudflare Worker 后台、cf-probe 探针、持久化脚本布局（含 offline-cache 统一缓存与外部灾备提醒）、Telegram Bot 接入与配对、muse-bridge 本地 shim（不接外部模型 API，由 Muse 自身决策，支持 tool_calls 多轮指挥 Hermes 原生工具）、沙盒内看门狗、平台 hook 探针（检测/恢复拆分）、平台开机钩子、端到端验证。开工先问「全部安装 / 逐模块」（默认逐模块）；全文按 5 个模块 + 收尾组织，同一模块内连续执行，只在用户必须输入/扫码/平台点击时打断；每步五段式（命令 / 话术 / 用户手动动作 / 做完的标志 / 排错表格），全部脚本完整代码直接内嵌，复制即可用。触发词：部署保活、给新账号也来一套、装探针、Telegram 机器人、沙盒重建恢复、保活脚本、自动审批、审批卡片、MuseAutoApprove、muse-bridge。"
+version: 3.0.0
 license: MIT
 metadata:
   hermes:
@@ -13,32 +13,40 @@ metadata:
         cloudflare,
         probe,
         hermes,
-        weixin,
+        telegram,
+        muse-bridge,
         deployment,
         muse-auto-approve,
       ]
-    related_skills: [weixin-instant-ack, sandbox-environment-recon]
+    related_skills: [telegram-instant-ack, sandbox-environment-recon]
 ---
 
-# 沙盒保活 + Hermes 微信机器人：一键部署手册
+# 沙盒保活 + Hermes Telegram 机器人（muse-bridge 模型桥接）：一键部署手册
 
 ## 一、这套东西是什么
 
 平台（Muse / hatch 沙盒）会不定期**重建**沙盒：整机从外部删掉重装，沙盒内的一切——
 进程、systemd、cron、/tmp——全部消失，只有 `$HOME`（`/home/hatch`）会保留。
 
-本手册部署的是一套**三层保活 + 微信机器人**：
+本手册部署的是一套**三层保活 + Telegram 机器人 + muse-bridge 模型桥接**：
 
 | 层         | 组件                                                                         | 对付的故障                               | 恢复时间                    |
 | ---------- | ---------------------------------------------------------------------------- | ---------------------------------------- | --------------------------- |
 | 探针       | `cf-probe`（systemd 服务）→ CF Server Monitor 后台                           | 你想知道机器到底活着还是挂了             | 60 秒上报一次               |
-| Layer 1    | `watchdog.sh`（沙盒内 cron，每分钟）                                         | 机器活着，但某个进程挂了 / 微信连接卡死  | 1 分钟内                    |
+| Layer 1    | `watchdog.sh`（沙盒内 cron，每分钟）                                         | 机器活着，但某个进程挂了 / Telegram 连接卡死 / shim 掉了 | 1 分钟内                    |
 | Layer 2a   | 平台 hook 探针（每 10 秒 bash 轮询，跑在沙盒外；健康零 token，连续异常才唤醒 agent 恢复） | 整机被重建，沙盒内 cron 全灭             | 10 秒级发现，约 2 分钟恢复 |
 | Layer 2b   | 平台原生开机钩子（每次启动跑一次）                                           | 同上，但更快（开机即恢复）               | 开机后约 100 秒             |
 | Layer 3    | `restore-all.sh`（幂等一键恢复）                                             | 被 1、2a、2b 调用                        | 约 2 分钟                   |
 | 审批自动化 | `MuseAutoApprove`（沙盒内 node 常驻；步骤 1–4 安装启动、第 15 步起接入保活） | 沙盒访问新域名时平台弹审批卡片、外联卡住 | 默认每 10 秒一轮询          |
+| 模型桥接   | `muse-bridge`（本地 shim 127.0.0.1:18080 + 落盘队列 + bridge-tripwire hook，步骤 9–10 装、步骤 13b 接入 hook） | Telegram 消息需要决策，但不想依赖外部模型 API | hook 15 秒一轮询，零 token 空转 |
 
 平台重建无法阻止，本手册只保证「重建后自动恢复」。
+
+> **架构要点（先说清楚，后面每一步都基于这个前提）**：这套 Telegram 机器人**默认不接任何外部大模型 API**。链路是
+> `Telegram 消息 → Hermes 网关 → 本地 muse-bridge shim（127.0.0.1:18080，伪装成 OpenAI 兼容接口）→ 落盘队列 → 平台 hook 探针发现有待认领任务才唤醒你（Muse / 当前 Agent 自己）→ 你用自己的全部能力（浏览器、文件、记忆、技能）直接决策`。
+> 需要 Hermes 动手时，你把 `tool_calls` 写回队列，Hermes 执行它的原生工具（terminal / read_file / skills 等），结果再回流成新的队列任务，最多 6 轮。**健康时 shim 和探针都不消耗模型 token，只有真的有消息待处理才唤醒你**。
+> 代价：Telegram 每条回复有轮询周期 + 你作答的延迟（实测约 1~2 分钟，工具多轮任务每轮再加约 1 分钟），这是"不接外部模型、由你亲自决策"必须付出的固有成本，要提前告知用户。
+> 逃生舱：消息以 `!hermes` 开头会跳过 shim 的排队逻辑，直接透传给一个**可选**配置的上游模型 API（见步骤 9 的"进阶：逃生舱"）；不配置这个可选项完全不影响主链路。
 
 ## 二、怎么用这本手册（AI 必须遵守的行事规则）
 
@@ -55,10 +63,12 @@ metadata:
    - **⑤ 🛠️ 常见失败与处理**：表格，现象 → 原因 → 处理。
 3. **每条命令都要真跑过。** 报告结果时说清楚「跑了什么、看到什么」。跑不了就直说跑不了，不要编造输出。
 4. **密钥纪律（四条铁律，违反必出事）**：
-   - 真实 SECRET / API Key / Worker 域名 / API 地址**绝不写进任何文档、Skill、日志、记忆**——本手册里全用占位符：`<PROBE_ID>`、`<API_SECRET>`、`<WORKER_URL>`、`<API_BASE_URL>`、`<MODEL_NAME>`。
+   - 真实 SECRET / API Key / Worker 域名 / API 地址 / Telegram Bot Token**绝不写进任何文档、Skill、日志、记忆**——本手册里全用占位符：`<PROBE_ID>`、`<API_SECRET>`、`<WORKER_URL>`、`<TELEGRAM_BOT_TOKEN>`、`<TELEGRAM_CHAT_ID>`。
    - 密钥优先**让用户自己生成**，通过**安全页面**发给你；只有用户明确同意时才由 AI 生成并在聊天里**一次性**显示。（例外：MuseAutoApprove 的 muse.ai 账号密码——沙盒里没有可用安全入口，按用户要求**走聊天框明文**，见第六章。）
    - **先脱敏再打印**，不是"先打印再脱敏"。需要确认密钥存在，就只输出计数/长度/路径/布尔值，不输出值本身。
    - 含密钥的文件（`install-cf-probe.sh`、`~/.hermes/.env`）权限一律 600，且**不要用文件读取工具打开**（内容会进会话历史）。
+   - **持久卷不是唯一数据存储**：`$HOME` 所在的持久卷由平台 LUKS 加密，控制平面关停后解密密钥可能丢失——这不是"重建丢数据"那种可恢复故障，是**整卷可能再也打不开**。所以：每个密钥/Token 生成或更换时，顺手提醒用户**自己在密码管理器里也留一份**（Worker `API_SECRET`、`<TELEGRAM_BOT_TOKEN>`、muse.ai 账号等）；AI 自己不负责外发备份，只负责提醒 + 落盘 600。
+   - **二进制/工具统一缓存到 `~/workspace/setup/offline-cache/`**，不要只装进 `/usr/local/bin/`——那是系统目录，重建必丢。详见模块 C。
 5. **谁做什么**（重要，别硬揽）：
    - 沙盒内的一切（跑脚本、装服务、写 cron、改文件）→ 任何有 shell 的 Agent 都能做。
    - **Layer 2a（平台 hook 探针）和 Layer 2b（平台开机钩子）跑在沙盒外面**：只有**平台侧 Agent**（Muse）或**用户在平台端**才能创建。如果你是在沙盒里跑的 Agent，这两步要**请求用户/平台侧 Agent 执行**，并把现成的 hook 脚本、hook 定义与恢复提示词交给他们（本手册第 13、14 步给了全文）。
@@ -72,10 +82,10 @@ metadata:
 | -------------------- | --------------------------------------------------- | ----- | ----------- | ------------------------------------------------- |
 | **A｜自动审批底座**  | 装 MuseAutoApprove 并常驻，外联审批自动批           | 1–4   | 四~七       | 选策略 + 发 muse.ai 账号密码 + 首次装包点一次卡片 |
 | **B｜监控与探针**    | CF 监控后台 + cf-probe 探针                         | 5–6   | 八~九       | 给 CF Token（或网页部署）+ 后台拿安装命令         |
-| **C｜保活底座**      | 保活脚本落盘 + 离线包缓存                           | 7–8   | 十~十一     | 无（全自动）                                      |
-| **D｜微信机器人**    | 装 Hermes + 接模型 API + 微信扫码绑定与配对         | 9–10  | 十二~十三   | 模型 API 地址/Key + 微信扫码 + 转配对码           |
-| **E｜三层保活接入**  | Layer 1 看门狗、平台授权、Layer 2a/2b、MAA 保活补丁 | 11–15 | 十四~十八   | 平台端点 3 项授权                                 |
-| **收尾｜验收与运维** | MAA 验证/排障/交互/升级、最终验证                   | 16–20 | 十九~二十三 | 微信发消息测试 + 决定是否做重建演练               |
+| **C｜保活底座**      | 保活脚本落盘 + offline-cache 离线包缓存             | 7–8   | 十~十一     | 无（全自动）                                      |
+| **D｜Telegram + muse-bridge** | 装 Hermes + muse-bridge 本地 shim（不接外部模型）+ Telegram Bot 绑定与配对 | 9–10  | 十二~十三   | 给 Telegram Bot Token + 确认 chat_id + 转配对码   |
+| **E｜三层保活接入**  | Layer 1 看门狗、平台授权、Layer 2a/2b/2c（bridge-tripwire）、MAA 保活补丁 | 11–15 | 十四~十八   | 平台端点 4 项授权                                 |
+| **收尾｜验收与运维** | MAA 验证/排障/交互/升级、最终验证                   | 16–20 | 十九~二十三 | Telegram 发消息测试 + 决定是否做重建演练          |
 
 ### 必须用户介入的环节（只有这 8 处要停）
 
@@ -85,10 +95,10 @@ metadata:
 2. **MAA 策略与账号**：选 A（永久允许）/ B（每次只批一次）；把 muse.ai 邮箱密码发在聊天框（步骤 1、3）。
 3. **首次装包卡片**：`git clone` / `npm install` 弹审批卡片时，用户手动点一次「允许」（步骤 2）。
 4. **CF 后台**：给 Cloudflare API Token（或自己在网页部署）；后台「添加服务器」把安装命令贴回来；定 `API_SECRET`（步骤 5）。
-5. **模型 API**：接口地址 + API Key + 模型名（步骤 9）。
-6. **微信扫码**：手机扫码 + 确认登录；之后把机器人回的**配对码**转给 AI（步骤 10）。
-7. **平台授权**：平台端确认「保活探针 hook / 开机钩子 / root 执行」3 项（步骤 12）。
-8. **最终验证**：微信给机器人发消息测试；决定是否做重建演练（步骤 20）。
+5. **Telegram Bot**：用户自己找 @BotFather 建一个 Bot，把 Token 经安全页面给你；muse-bridge 本地 shim 不需要用户提供任何外部模型 API（步骤 9）。
+6. **Telegram 绑定**：用户给自己的 Bot 发一条消息确认 chat_id；之后把机器人回的**配对码**转给 AI（步骤 10）。
+7. **平台授权**：平台端确认「保活探针 hook / bridge-tripwire hook / 开机钩子 / root 执行」4 项（步骤 12）。
+8. **最终验证**：Telegram 给机器人发消息测试；决定是否做重建演练（步骤 20）。
 
 ## 三、开工前的询问与设置 + 两次探测
 
@@ -123,9 +133,10 @@ metadata:
 # 探测 1：我是谁、在哪、有没有 systemd / root
 whoami; echo "HOME=$HOME"; id -u; ls -d "$HOME/workspace" 2>/dev/null || echo "no workspace dir"
 systemctl --version 2>/dev/null | head -1 || echo "no systemd"
-# 探测 2：能不能出去（GitHub / Cloudflare / 模型 API 端点）
-curl -sS -m 8 -o /dev/null -w 'github %{http_code}\n' https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh
-curl -sS -m 8 -o /dev/null -w 'cf     %{http_code}\n' https://api.cloudflare.com/client/v4
+# 探测 2：能不能出去（GitHub / Cloudflare / Telegram API）
+curl -sS -m 8 -o /dev/null -w 'github   %{http_code}\n' https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh
+curl -sS -m 8 -o /dev/null -w 'cf       %{http_code}\n' https://api.cloudflare.com/client/v4
+curl -sS -m 8 -o /dev/null -w 'telegram %{http_code}\n' https://api.telegram.org
 ```
 
 期望：`whoami` 是 root 或可用 sudo 的用户；`HOME` 指向可持久化的家目录；systemd 存在；两个 HTTP 码不是 000（000 = 连不上）。若 GitHub 不通，第 8 步的离线缓存就是**必需**的，不是可选项。**探测 2 两个都是 000 时，先回头确认上面的「直接网络协议」已全部打开，再谈别的。**
@@ -217,7 +228,7 @@ export PATH="$HOME/.local/bin:$PATH"; node -v && npm -v
 # 2) 克隆仓库（更新 = git pull），app 在仓库的 MuseAutoApprove/ 子目录
 cd ~/workspace
 [ -d muse-guardian/.git ] && git -C muse-guardian pull --ff-only \
-  || git clone https://github.com/bytehola/muse-guardian.git
+  || git clone https://github.com/andyliu/hatch-keepalive.git muse-guardian
 ls muse-guardian/MuseAutoApprove/muse-daemon.cjs
 
 # 3) 装依赖 + 双自检
@@ -794,12 +805,19 @@ echo "    sha256=$(cat "$OUT.sha256")"
 **目标**：把 7 个保活脚本放到 `$HOME/workspace/setup/`，全部可执行、全部语法检查通过。
 
 > **重建后 `$HOME` 保留，系统目录全丢**。在：`~/workspace/`、`~/.hermes/`（程序与数据）、`~/.local/bin/`。不在：`/usr/local/bin/cf-probe`、`/etc/systemd/system/cf-probe.service`、`/etc/config/cf-probe/`、`/usr/sbin/sshd`、root crontab、`/tmp`。恢复脚本就是把这些按需重装。
+>
+> **平台更新 ≠ 沙盒重建，但同样危险**：平台整体升级时会重建容器 overlay 层，手动装进 `/usr/local/bin/`、`/etc/` 的东西、`apt install` 的包全部不保证保留，`/tmp` 是 tmpfs 重启即清零——这条规则不止适用于"沙盒重建"事件，平台做容器更新时同样适用。**检测是否发生过更新**：`hatch --version | grep built`，构建时间变了就是更新了，建议每次开工先跑一次这条命令留痕。
+> **`~/workspace/setup/` 本身就是本手册的 offline-cache 目录**——所有二进制、安装脚本、.deb 依赖闭包都落在这里（而不是只装进 `/usr/local/bin/`），`restore-all.sh` 就是本手册的 `restore.sh`：平台更新或沙盒重建后跑它就能一键装回系统组件。
+> **持久卷不是唯一数据存储**：`$HOME` 所在持久卷由平台 LUKS 加密，控制平面关停后解密密钥可能丢失——这种情况下连"重建恢复"都救不了，因为卷本身打不开。所以本手册每次生成/更换密钥时都会提醒用户在密码管理器里自留一份（见第二章密钥纪律）；**不要**因为东西"已经在持久卷里了"就以为万无一失。
 
 ### ① 🤖 AI 执行（命令）
 
 ```bash
 mkdir -p ~/workspace/setup/deb-cache ~/workspace/setup/logs
 mkdir -p ~/workspace/backups/hermes-home ~/workspace/tools ~/.hermes/memories
+
+# 顺手留痕一次 hatch 构建时间，后续巡检对比它就知道平台是否更新过
+hatch --version 2>/dev/null | grep -i built || echo "当前平台无 hatch --version 或不含 built 字段（非 hatch 平台，跳过）"
 
 # 把本节末尾的 7 个脚本按路径落盘，然后统一设置权限 + 语法检查
 chmod +x ~/workspace/setup/*.sh
@@ -911,7 +929,7 @@ install_offline_debs() {
 
 ```bash
 #!/usr/bin/env bash
-# watchdog.sh — 每 1 分钟巡检：cf-probe 探针 / hermes 微信网关 / sshd。
+# watchdog.sh — 每 1 分钟巡检：cf-probe 探针 / hermes telegram 网关 / muse-bridge shim / sshd。
 # 挂了就地修复；修不好写日志。设计遵循 awesome-skills/muse-reverse-ssh：
 # 原子 mkdir 单实例锁（不用 flock，避免 fd 被子进程继承导致锁死）、
 # pgrep 中括号技巧（避免匹配到检查进程自身）、/proc cmdline 校验。
@@ -988,23 +1006,23 @@ else
   fi
 fi
 
-# --- 2a. hermes 微信网关：进程活着但连接卡死 ---
+# --- 2a. hermes telegram 网关：进程活着但连接卡死 ---
 # 对应 skill 的 "A live tunnel process does not mean a live tunnel"：
-# 只查进程查不出微信 poll 卡死，看日志里 poll error 是否持续超过 5 分钟。
-WXLOG="$HOME/.hermes/logs/weixin-gateway.log"
-WX_RESTART_TS="$SETUP_DIR/.wx-wedged-restart-ts"
-if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1 && [ -f "$WXLOG" ]; then
+# 只查进程查不出 telegram 长轮询卡死，看日志里 poll error 是否持续超过 5 分钟。
+TGLOG="$HOME/.hermes/logs/telegram-gateway.log"
+TG_RESTART_TS="$SETUP_DIR/.tg-wedged-restart-ts"
+if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1 && [ -f "$TGLOG" ]; then
   since="$(date -d '10 minutes ago' '+%F %T')"
-  mapfile -t wxerrs < <(awk -v since="$since" \
-    'index($0,"poll error")>0 && substr($0,1,19)>=since {print substr($0,1,19)}' "$WXLOG" 2>/dev/null)
-  if [ "${#wxerrs[@]}" -ge 3 ]; then
-    first_ts="${wxerrs[0]}"; last_ts="${wxerrs[$((${#wxerrs[@]}-1))]}"
+  mapfile -t tgerrs < <(awk -v since="$since" \
+    'index($0,"poll error")>0 && substr($0,1,19)>=since {print substr($0,1,19)}' "$TGLOG" 2>/dev/null)
+  if [ "${#tgerrs[@]}" -ge 3 ]; then
+    first_ts="${tgerrs[0]}"; last_ts="${tgerrs[$((${#tgerrs[@]}-1))]}"
     if [ "$(date -d "$last_ts" +%s)" -gt "$(( $(date -d "$first_ts" +%s) + 300 ))" ]; then
       # 15 分钟内只因卡死重启一次，避免全网故障时反复重启
       now="$(date +%s)"; last_restart=0
-      [ -f "$WX_RESTART_TS" ] && last_restart="$(cat "$WX_RESTART_TS" 2>/dev/null || echo 0)"
+      [ -f "$TG_RESTART_TS" ] && last_restart="$(cat "$TG_RESTART_TS" 2>/dev/null || echo 0)"
       if [ "$((now - last_restart))" -ge 900 ]; then
-        log "微信 poll 持续报错超过 5 分钟（$first_ts ~ $last_ts），判定连接卡死，重启网关"
+        log "telegram 长轮询持续报错超过 5 分钟（$first_ts ~ $last_ts），判定连接卡死，重启网关"
         # 精确 kill：优先 gateway.pid。注意该文件是 JSON（{"pid":123,"kind":"hermes-gateway",...}），
         # 不能直接 cat 当数字用；解析出 pid 后还要校验 /proc/<pid>/cmdline 命中网关进程模式（hermes-agent.*[g]ateway）。
         # 拿不到有效 pid 才枚举 pgrep 命中进程，并排除自身与父进程——
@@ -1039,23 +1057,23 @@ if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1 && [ -f "$WXLOG" ]; then
             kill -TERM "$p" 2>/dev/null || true
           done
         fi
-        echo "$now" > "$WX_RESTART_TS"
+        echo "$now" > "$TG_RESTART_TS"
         sleep 3
       else
-        log "微信 poll 持续报错，但 15 分钟内已重启过，跳过"
+        log "telegram 长轮询持续报错，但 15 分钟内已重启过，跳过"
       fi
     fi
   fi
-  unset wxerrs
+  unset tgerrs
 fi
 
-# --- 2b. hermes 微信网关：进程缺失则重启 ---
+# --- 2b. hermes telegram 网关：进程缺失则重启 ---
 # 进程行有新老两种形态：`hermes gateway run` 与 `python3 -I -c` 包装（cmdline 里是 hermes-agent 路径）。统一用 hermes-agent.*[g]ateway 检测，两种都能命中；[g] 避免自匹配。
 if ! pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
   log "hermes gateway 进程丢失，尝试重启"
-  if compgen -G "$HOME/.hermes/weixin/accounts/*.json" > /dev/null 2>&1; then
+  if compgen -G "$HOME/.hermes/telegram/accounts/*.json" > /dev/null 2>&1; then
     mkdir -p "$HOME/.hermes/logs"
-    nohup hermes gateway run >> "$HOME/.hermes/logs/weixin-gateway.log" 2>&1 &
+    nohup hermes gateway run >> "$HOME/.hermes/logs/telegram-gateway.log" 2>&1 &
     sleep 3
     if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
       log "hermes gateway 重启成功"
@@ -1063,7 +1081,22 @@ if ! pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
       log "hermes gateway 重启后仍无进程"
     fi
   else
-    log "无微信账号凭据，跳过网关重启"
+    log "无 telegram 账号凭据，跳过网关重启"
+  fi
+fi
+
+# --- 2c. muse-bridge shim：本地模型桥接，不在跑就拉起 ---
+# shim 是纯 Python 标准库 http.server，零外部依赖；缺了就直接重启，不需要像网关那样分阶段处理。
+BRIDGE_DIR="$HOME/.hermes/muse-bridge"
+if [ -x "$SETUP_DIR/muse-bridge-shim.py" ] && ! pgrep -f "[m]use-bridge-shim.py" >/dev/null 2>&1; then
+  log "muse-bridge shim 进程丢失，尝试重启"
+  mkdir -p "$BRIDGE_DIR/logs"
+  nohup python3 "$SETUP_DIR/muse-bridge-shim.py" >> "$BRIDGE_DIR/logs/shim.log" 2>&1 &
+  sleep 2
+  if pgrep -f "[m]use-bridge-shim.py" >/dev/null 2>&1; then
+    log "muse-bridge shim 重启成功"
+  else
+    log "muse-bridge shim 重启后仍无进程"
   fi
 fi
 
@@ -1101,7 +1134,8 @@ fi
 
 # --- 4. 日志裁剪：把所有日志压回 10MB 以内 ---
 for f in "$LOG" \
-         "$HOME/.hermes/logs/weixin-gateway.log" \
+         "$HOME/.hermes/logs/telegram-gateway.log" \
+         "$HOME/.hermes/muse-bridge/logs/shim.log" \
          "$HOME/workspace/muse-guardian/MuseAutoApprove"/log/*.ndjson \
          "$HOME/workspace/muse-guardian/MuseAutoApprove"/log/muse-console.log \
          "$HOME/hooks/logs"/*.jsonl \
@@ -1124,9 +1158,10 @@ log "巡检完成"
 #
 # 检查项（与 watchdog.sh / restore-all.sh 保持一致）：
 #   1. cf-probe systemd 服务 active
-#   2. hermes 微信网关进程存活
-#   3. sshd 进程存活
-#   4. cron 进程存活 且 crontab 里有看门狗
+#   2. hermes telegram 网关进程存活
+#   3. muse-bridge shim 进程存活（装了才检查）
+#   4. sshd 进程存活
+#   5. cron 进程存活 且 crontab 里有看门狗
 
 # HOME 加固：若当前 HOME 下找不到 setup 目录但 /home/hatch 下有，
 # 说明运行环境异常（如 HOME=/root），纠正后再继续（见 skill 避坑）
@@ -1142,6 +1177,9 @@ if [ "$(systemctl is-active cf-probe 2>/dev/null)" != "active" ]; then
 fi
 if ! pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
   failures="$failures hermes-gateway"
+fi
+if [ -x "$SETUP_DIR/muse-bridge-shim.py" ] && ! pgrep -f "[m]use-bridge-shim.py" >/dev/null 2>&1; then
+  failures="$failures muse-bridge-shim"
 fi
 if ! pgrep -f "[/]usr/sbin/sshd" >/dev/null 2>&1; then
   failures="$failures sshd"
@@ -1307,10 +1345,10 @@ echo "OK: 恢复流程结束，详见 $LOG"
 # 原理：Hermes 的一切都在 $HOME 下（~/.hermes 程序+数据、~/.local/bin 启动器），
 # 沙盒重建只丢系统目录，所以通常只需重跑一次安装脚本即可恢复。
 #
-# 三条硬规则（2026-09-26 实测踩过，违反必然导致微信全链路静默失败）：
+# 三条硬规则（2026-09-26 实测踩过，违反必然导致 telegram 全链路静默失败）：
 #  1. 健康时【完全跳过 installer】。installer 的 post-build maintenance 会动
 #     ~/.hermes/state.db；网关正在运行、句柄在 state.db 上时被换掉文件，
-#     网关会抛 StateDbReplacedError 并拒绝一切写入（=所有微信回复失败）。
+#     网关会抛 StateDbReplacedError 并拒绝一切写入（=所有 telegram 回复失败）。
 #     所以：hermes 可用 且 数据完好 → 什么都不做，只确保网关在跑。
 #  2. 真正要动东西（缺 hermes / 缺数据）时，先【安全停网关】再动手，做完重新启动。
 #     停网关优先用 gateway.pid 里的 pid（该文件是 JSON，不是裸数字），
@@ -1328,7 +1366,7 @@ SAVED="$SETUP_DIR/hermes-install.sh"
 LATEST="$SETUP_DIR/hermes-install.latest.sh"
 BACKUP="$HOME/workspace/backups/hermes-home"
 INSTALL_URL="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
-GWLOG="$HOME/.hermes/logs/weixin-gateway.log"
+GWLOG="$HOME/.hermes/logs/telegram-gateway.log"
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -1408,22 +1446,41 @@ stop_gateway() {
 # --- 启动网关：没在跑才启动（避免双实例） ---
 start_gateway_if_needed() {
   if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
-    log "微信网关已在运行，无需启动"
+    log "telegram 网关已在运行，无需启动"
     return 0
   fi
-  if compgen -G "$HOME/.hermes/weixin/accounts/*.json" > /dev/null 2>&1; then
+  if compgen -G "$HOME/.hermes/telegram/accounts/*.json" > /dev/null 2>&1; then
     mkdir -p "$HOME/.hermes/logs"
     nohup hermes gateway run >> "$GWLOG" 2>&1 &
     sleep 3
     if pgrep -f "hermes-agent.*[g]ateway" >/dev/null 2>&1; then
-      log "微信网关已启动"
+      log "telegram 网关已启动"
       return 0
     fi
     log "ERROR 网关启动后仍无进程，看 $GWLOG"
     return 1
   fi
-  log "无微信账号凭据，跳过网关启动"
+  log "无 telegram 账号凭据，跳过网关启动"
   return 0
+}
+
+# --- muse-bridge shim：没在跑就启动（不依赖网关是否就绪，可独立恢复） ---
+start_shim_if_needed() {
+  local shim="$SETUP_DIR/muse-bridge-shim.py" bridge_dir="$HOME/.hermes/muse-bridge"
+  [ -x "$shim" ] || { log "muse-bridge-shim.py 未安装，跳过（见步骤 9）"; return 0; }
+  if pgrep -f "[m]use-bridge-shim.py" >/dev/null 2>&1; then
+    log "muse-bridge shim 已在运行，无需启动"
+    return 0
+  fi
+  mkdir -p "$bridge_dir/logs" "$bridge_dir/queue/pending" "$bridge_dir/queue/claimed" "$bridge_dir/queue/done"
+  nohup python3 "$shim" >> "$bridge_dir/logs/shim.log" 2>&1 &
+  sleep 2
+  if pgrep -f "[m]use-bridge-shim.py" >/dev/null 2>&1; then
+    log "muse-bridge shim 已启动"
+    return 0
+  fi
+  log "ERROR muse-bridge shim 启动后仍无进程，看 $bridge_dir/logs/shim.log"
+  return 1
 }
 
 # --- 安装/升级 hermes（只在真的需要时调用） ---
@@ -1496,6 +1553,7 @@ else
 fi
 
 start_gateway_if_needed || rc=1
+start_shim_if_needed || rc=1
 
 if [ "$rc" = 0 ]; then
   echo "OK: hermes 已就绪"
@@ -1720,13 +1778,16 @@ cat ~/workspace/setup/cf-probe-linux-amd64.sha256               # 有值即可�
 
 ---
 
-# 模块 D｜微信机器人（Hermes + 模型 API + 扫码，步骤 9–10）
+# 模块 D｜Telegram + muse-bridge（Hermes + 本地模型桥接，步骤 9–10）
 
-装 Hermes、接上用户自己的模型接口，再用手机扫码把微信绑到网关，最后过一遍首次私聊的配对。**用户介入**：给模型 API 地址与 Key、微信扫码并确认、把机器人回的配对码转给 AI。
+装 Hermes、部署 muse-bridge 本地 shim（不接外部模型 API，让 Muse/当前 Agent 自己决策），再接入用户的 Telegram Bot，最后过一遍首次私聊的配对。**用户介入**：给 Telegram Bot Token、确认 chat_id、把机器人回的配对码转给 AI。
 
-## 十二、步骤 9：安装 Hermes + 配置模型 API
+## 十二、步骤 9：安装 Hermes + 部署 muse-bridge（不接外部模型 API）
 
-**目标**：Hermes 装好、能跑，接上用户自己的 OpenAI 兼容模型接口。
+**目标**：Hermes 装好、能跑；本地 muse-bridge shim 常驻在 `127.0.0.1:18080`，Hermes 的"模型"就是这个 shim，不需要任何外部大模型账号。
+
+> **架构**：Hermes 把模型请求发给 shim（shim 对外伪装成 OpenAI 兼容的 `/v1/chat/completions`）。shim 不调用任何大模型，而是把请求落盘进队列、长轮询等结果。队列由步骤 13b 注册的 `telegram-bridge-tripwire` hook 探针发现后唤醒你（当前 Agent），你决定直接回复还是发 `tool_calls` 让 Hermes 执行工具；结果写回队列，shim 读到后把它当作模型的回复返回给 Hermes。**全程不需要用户提供模型 API Key**。
+> **逃生舱是可选项**：消息以 `!hermes` 开头时，shim 会把请求透传给一个可选配置的上游模型（`UPSTREAM_*`），不配置这个可选项完全不影响主链路——本步骤默认跳过它，想要再翻到本步 ⑥"进阶：逃生舱"。
 
 ### ① 🤖 AI 执行（命令）
 
@@ -1738,120 +1799,147 @@ bash ~/workspace/setup/restore-hermes.sh
 export PATH="$HOME/.local/bin:$PATH"
 hermes --version
 
-# 3. 写模型配置（真实地址只写进 config.yaml，不进任何文档）
-#    幂等：已存在 my-api provider 就不重复追加（重跑不会写出第二份 model:/providers: 块）
-if ! grep -q 'my-api' ~/.hermes/config.yaml 2>/dev/null; then
-  cat >> ~/.hermes/config.yaml <<'YAML_EOF'
-model:
-  default: "<MODEL_NAME>"
-  provider: "my-api"
-providers:
-  my-api:
-    base_url: "<API_BASE_URL>"
-    key_env: "MY_API_KEY"
-YAML_EOF
-  echo "模型配置已写入"
+# 3. 生成 muse-bridge 本地鉴权 Token（纯本地用途，不离开沙盒，但仍按密钥纪律落盘 600）
+if ! grep -q '^MUSE_BRIDGE_TOKEN=' ~/.hermes/.env 2>/dev/null; then
+  printf 'MUSE_BRIDGE_TOKEN=%s\n' "$(openssl rand -hex 24)" >> ~/.hermes/.env
+  echo "MUSE_BRIDGE_TOKEN 已生成并写入"
 else
-  echo "模型配置已存在，跳过（要改地址/模型请手动编辑 ~/.hermes/config.yaml）"
-fi
-
-# 4. Key 写进 .env（600），值从环境变量来，不进 shell 历史
-#    USER_MODEL_KEY 由用户经安全页面提供（值只经环境变量传入）
-#    幂等：已存在 MY_API_KEY= 就不重复追加（否则下面的 grep -c 期望 1 会失败）
-if ! grep -q '^MY_API_KEY=' ~/.hermes/.env 2>/dev/null; then
-  printf 'MY_API_KEY=%s\n' "$USER_MODEL_KEY" >> ~/.hermes/.env
-  echo "MY_API_KEY 已写入"
-else
-  echo "MY_API_KEY 已存在，跳过（要换 Key 请先删掉该行再重跑）"
+  echo "MUSE_BRIDGE_TOKEN 已存在，跳过"
 fi
 chmod 600 ~/.hermes/.env
-unset USER_MODEL_KEY
 
-# 5. 自检：模型配置读得到、Key 存在（只打印布尔值和长度，不打印值）
-grep -q 'my-api' ~/.hermes/config.yaml && echo "provider 配置已写入"
-grep -c '^MY_API_KEY=' ~/.hermes/.env            # 期望 1
-awk -F= '/^MY_API_KEY=/{print "MY_API_KEY 长度: " length($2)}' ~/.hermes/.env
+# 4. 写模型配置：默认 provider 指向本地 shim，不配置任何外部模型
+#    幂等：已存在 muse-bridge provider 就不重复追加
+if ! grep -q 'muse-bridge' ~/.hermes/config.yaml 2>/dev/null; then
+  cat >> ~/.hermes/config.yaml <<'YAML_EOF'
+model:
+  default: "muse-bridge-model"
+  provider: "muse-bridge"
+providers:
+  muse-bridge:
+    base_url: "http://127.0.0.1:18080/v1"
+    key_env: "MUSE_BRIDGE_TOKEN"
+adapters:
+  telegram:
+    # Hermes 的 telegram 适配器在调模型时带上这个 header，shim 据此判断"这是 Telegram 来的消息，要排队"；
+    # 其它来源（如 `hermes chat` CLI）不带这个 header，shim 会尝试走可选的上游透传（见进阶：逃生舱）
+    extra_headers:
+      X-Muse-Channel: "telegram"
+YAML_EOF
+  echo "模型配置已写入（provider=muse-bridge，不含外部模型信息）"
+else
+  echo "模型配置已存在，跳过"
+fi
+
+# 5. 落盘 muse-bridge-shim.py（代码见本节末尾）并启动
+chmod +x ~/workspace/setup/muse-bridge-shim.py
+mkdir -p ~/.hermes/muse-bridge/logs ~/.hermes/muse-bridge/queue/pending \
+         ~/.hermes/muse-bridge/queue/claimed ~/.hermes/muse-bridge/queue/done
+pgrep -f "[m]use-bridge-shim.py" >/dev/null || \
+  nohup python3 ~/workspace/setup/muse-bridge-shim.py >> ~/.hermes/muse-bridge/logs/shim.log 2>&1 &
+sleep 2
+pgrep -f "[m]use-bridge-shim.py" >/dev/null && echo "shim 已启动"
 ```
 
-**连通性自检**（推荐做，避免"装好了但一问就报错"）：
+**连通性自检**（不排队、不需要队列认领方在跑，纯粹验证 shim 自身起来了、鉴权对）：
 
 ```bash
-hermes --non-interactive "只回复两个字：在线" 2>&1 | tail -5
+TOKEN="$(awk -F= '/^MUSE_BRIDGE_TOKEN=/{print $2}' ~/.hermes/.env)"
+curl -sS -m 8 -X POST http://127.0.0.1:18080/v1/chat/completions \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"muse-bridge-selftest","messages":[{"role":"user","content":"ping"}]}'
+unset TOKEN
+# 期望：立即（<1 秒）返回一个 JSON，choices[0].message.content 形如 "muse-bridge selftest ok"
+# 这条请求命中 shim 内置的自检分支，不会进队列、不会唤醒任何 Agent
 ```
 
 ### ② 💬 对用户说（可原样发送）
 
-> 🧠 现在装 Hermes（微信机器人的大脑）并接你的模型 API。需要你提供两样：
+> 🧠 现在装 Hermes（Telegram 机器人的壳）并部署 muse-bridge：**不需要你提供任何外部模型 API**，机器人收到消息后由我（当前这个 Agent）直接用我自己的能力决策，需要动手时再指挥 Hermes。
 >
-> 1. **接口地址**：形如 `http://<主机>:<端口>/v1`（OpenAI 兼容）；
-> 2. **API Key**：**走安全页面**发我，别贴在聊天里。
-> 3. **模型名**：你那个接口上要用的模型标识（比如 `deepseek-v4.1-flash` 这类）。
->
-> - 我写到 `~/.hermes/.env`（600 权限，只有本机能读）；
+> 代价说清楚：每条 Telegram 回复大概要等 **1~2 分钟**（队列轮询 + 我作答的时间），需要我指挥 Hermes 做事的多轮任务每轮再加约 1 分钟——这是不依赖外部模型、换成我亲自决策的固有成本。
+> 你不用做任何事，我装完自检给你看。
 
 ### ③ 🙋 用户手动做
 
-- 通过安全页面提供 API 地址与 Key；提供模型名。
+无（这一步全自动）。
 
 ### ④ ✅ 做完的标志
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 hermes --version                                  # 期望打印版本号
-grep -q 'my-api' ~/.hermes/config.yaml && echo "配置 OK"
-ls -l ~/.hermes/.env                              # 期望 -rw-------（600）
-hermes --non-interactive "只回复两个字：在线" 2>&1 | tail -3   # 期望有正常回复，不是鉴权/连接错误
+grep -q 'muse-bridge' ~/.hermes/config.yaml && echo "模型配置 OK（指向本地 shim）"
+grep -c '^MUSE_BRIDGE_TOKEN=' ~/.hermes/.env      # 期望 1
+pgrep -f "[m]use-bridge-shim.py" >/dev/null && echo "shim 在跑"
+# 自检请求（见上）返回 selftest ok
 ```
 
-判据：版本号能打印 + 配置里有 provider + `.env` 权限 600 + 一次真实调用成功。
+判据：版本号能打印 + 配置 provider 指向 `127.0.0.1:18080` + shim 进程在跑 + 自检请求有即时回复。
 
 ### ⑤ 🛠️ 常见失败与处理
 
-| 现象                           | 原因                            | 处理                                                                                        |
-| ------------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------- |
-| `hermes: command not found`    | `~/.local/bin` 不在 PATH        | `export PATH="$HOME/.local/bin:$PATH"`；网关用 `nohup hermes gateway run` 启动时会自带 PATH |
-| 调用报 401/403                 | Key 错、过期或没写进 `.env`     | `grep -c '^MY_API_KEY=' ~/.hermes/.env`；值不要带引号                                       |
-| 调用超时                       | 地址端口不通                    | 让用户确认地址可从沙盒访问（`curl -m 8 <API_BASE_URL>/models`）；国内机房注意出网策略       |
-| installer 反复重装、把网关搞挂 | installer 无条件跑会动 state.db | 用本手册的 `restore-hermes.sh`：健康时跳过 installer，需要时才停网关                        |
-| `.env` 权限变成 644            | 复制/编辑时改了权限             | `chmod 600 ~/.hermes/.env`（里面是所有密钥）                                                |
+| 现象                              | 原因                                | 处理                                                                                     |
+| --------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------- |
+| `hermes: command not found`       | `~/.local/bin` 不在 PATH            | `export PATH="$HOME/.local/bin:$PATH"`；网关用 `nohup hermes gateway run` 启动时会自带 PATH |
+| 自检请求 401                      | Token 不一致                        | 确认 shim 读到的是当前 `.env` 里的 `MUSE_BRIDGE_TOKEN`（shim 启动时读取一次，改了要重启 shim） |
+| 自检请求连不上 / connection refused | shim 没启动                        | `pgrep -f "[m]use-bridge-shim.py"`；看 `~/.hermes/muse-bridge/logs/shim.log`               |
+| installer 反复重装、把网关搞挂    | installer 无条件跑会动 state.db     | 用本手册的 `restore-hermes.sh`：健康时跳过 installer，需要时才停网关                       |
+| `.env` 权限变成 644               | 复制/编辑时改了权限                 | `chmod 600 ~/.hermes/.env`（里面是所有密钥）                                               |
 
-## 十三、步骤 10：绑定微信（扫码登录）
+### ⑥ 进阶：逃生舱（可选，不装不影响主链路）
 
-**目标**：微信账号绑定到 Hermes 网关，用户能在微信里跟机器人对话。
+> 如果用户希望在"你不在线/你很忙"时仍有兜底回复，可以额外配置一个上游模型 API，消息以 `!hermes` 开头时 shim 会把它（去掉前缀后）透传给这个上游，走的是传统的"外部模型直接回复"链路，不经过队列、不唤醒你。**这是可选项，默认不配置**。
 
-> iLink 机器人登录：取二维码 → 用户扫码确认 → 凭据落 `~/.hermes/weixin/accounts/<account_id>.json`（网关读它）。**限制**：私聊可用，普通群消息可能收不到（非故障）。**首次私聊需配对**：机器人先回 8 位配对码而非内容，`hermes pairing approve weixin <配对码>` 批准后再发一次才有回复。
+```bash
+# 仅当用户主动要求逃生舱时才做，三项经安全页面获取：
+if ! grep -q '^UPSTREAM_API_KEY=' ~/.hermes/.env 2>/dev/null; then
+  printf 'UPSTREAM_API_KEY=%s\n' "$USER_UPSTREAM_KEY" >> ~/.hermes/.env
+  unset USER_UPSTREAM_KEY
+fi
+chmod 600 ~/.hermes/.env
+cat >> ~/.hermes/muse-bridge/bridge-config.json <<JSON_EOF
+{"upstream_base_url": "<UPSTREAM_API_BASE_URL>", "upstream_model": "<UPSTREAM_MODEL_NAME>", "upstream_key_env": "UPSTREAM_API_KEY"}
+JSON_EOF
+chmod 600 ~/.hermes/muse-bridge/bridge-config.json
+# 重启 shim 让配置生效
+pkill -f "[m]use-bridge-shim.py"; sleep 1
+nohup python3 ~/workspace/setup/muse-bridge-shim.py >> ~/.hermes/muse-bridge/logs/shim.log 2>&1 &
+```
+
+## 十三、步骤 10：绑定 Telegram
+
+**目标**：Telegram Bot 绑定到 Hermes 网关，用户能在 Telegram 里跟机器人对话。
+
+> Telegram Bot 登录：用户经 @BotFather 建 Bot 拿 Token → AI 用 `getMe` 验证 → 用户给 Bot 发一条消息确认 chat_id → 凭据落 `~/.hermes/telegram/accounts/<bot_username>.json`（网关读它）。**首次私聊需配对**：机器人先回 8 位配对码而非内容，`hermes pairing approve telegram <配对码>` 批准后再发一次才有回复。
 
 ### ① 🤖 AI 执行（命令）
 
 ```bash
-# 0. 依赖：二维码渲染需要 qrcode（含 PIL）
-python3 -c 'import qrcode' 2>/dev/null || python3 -m pip install "qrcode[pil]"
-
 # 1. 落盘两个辅助脚本（代码见下）到 ~/workspace/setup/
-#    weixin-qr-fetch.py / weixin-qr-confirm.py
+#    telegram-bot-verify.py / telegram-bot-confirm.py
 
-# 2. 取二维码（生成 PNG）
-python3 ~/workspace/setup/weixin-qr-fetch.py      # 输出：QR saved: <...>/weixin-login-qr.png
+# 2. 验证 Token（Token 只经环境变量传入，不进 shell 历史、不写文档）
+TELEGRAM_BOT_TOKEN="<用户经安全页面提供的 Token>" python3 ~/workspace/setup/telegram-bot-verify.py
+# 输出：Bot verified: @<bot_username>（并把 Token 落到 ~/.hermes/muse-bridge/.tg-token，600，供下一步用）
 
-# 3. 把 PNG 发给用户扫：在会话里用 MEDIA: 标记；如果需要在回合外发，用
-hermes send --to weixin:<chat_id> "MEDIA:$HOME/workspace/your_files/weixin-login-qr.png"
+# 3. 请用户给这个 Bot 发一条消息（任意内容，比如 /start），然后立刻轮询确认（180 秒内有效）
+python3 ~/workspace/setup/telegram-bot-confirm.py; echo "rc=$?"
+# 确认后会把账号信息落到 ~/.hermes/telegram/accounts/<bot_username>.json（600）
 
-# 4. 立刻开始轮询确认（180 秒内有效）
-python3 ~/workspace/setup/weixin-qr-confirm.py; echo "rc=$?"
-
-# 5. 确认成功后，把网关需要的两项写进 .env（值取自账号 json，不要打印出来）
+# 4. 把网关需要的两项写进 .env（值取自账号 json，不打印出来）
 python3 - <<'PY'
-import json, glob, os, re
-p = glob.glob(os.path.expanduser("~/.hermes/weixin/accounts/*@im.bot.json"))[0]
+import json, glob, os
+p = glob.glob(os.path.expanduser("~/.hermes/telegram/accounts/*.json"))[0]
 d = json.load(open(p))
 acct = os.path.basename(p).replace(".json", "")
 env = os.path.expanduser("~/.hermes/.env")
 text = open(env).read() if os.path.exists(env) else ""
 add = []
-if "WEIXIN_ACCOUNT_ID=" not in text:
-    add.append(f"WEIXIN_ACCOUNT_ID={acct}")
-if "WEIXIN_TOKEN=" not in text:
-    add.append(f"WEIXIN_TOKEN={d['token']}")
+if "TELEGRAM_BOT_USERNAME=" not in text:
+    add.append(f"TELEGRAM_BOT_USERNAME={acct}")
+if "TELEGRAM_CHAT_ID=" not in text:
+    add.append(f"TELEGRAM_CHAT_ID={d['chat_id']}")
 if add:
     with open(env, "a") as f:
         f.write("\n" + "\n".join(add) + "\n")
@@ -1859,141 +1947,321 @@ print("已写入 .env 的项:", [a.split('=')[0] for a in add], "（值不打印
 PY
 chmod 600 ~/.hermes/.env
 
-# 6. 启动网关（后台常驻）
+# 5. 启动网关（后台常驻）
 mkdir -p ~/.hermes/logs
-nohup hermes gateway run >> ~/.hermes/logs/weixin-gateway.log 2>&1 &
+nohup hermes gateway run >> ~/.hermes/logs/telegram-gateway.log 2>&1 &
 sleep 3; pgrep -f "hermes-agent.*[g]ateway" >/dev/null && echo "网关已启动"
 
-# 7. 批准配对（关键一步，别漏）：让用户先在微信里给机器人发一条消息，
+# 6. 批准配对（关键一步，别漏）：让用户再在 Telegram 里给机器人发一条消息，
 #    机器人回一个 8 位配对码（形如 3TNTE7PR）而不是内容——这是 Hermes 的 DM 配对安全机制。
 #    拿到码后批准（把 <配对码> 换成用户发来的那串）：
 export PATH="$HOME/.local/bin:$PATH"
 hermes pairing list                              # 看待批准/已批准的人
-hermes pairing approve weixin <配对码>            # 批准后该用户永久可用
+hermes pairing approve telegram <配对码>          # 批准后该用户永久可用
 
 # 批准是幂等的，再确认一次：已批准列表里有他，就算配对完成。
 hermes pairing list
 
-# 备注：weixin 适配器的 DM 策略由 WEIXIN_DM_POLICY 控制（open / allowlist / disabled / pairing）。
+# 备注：telegram 适配器的 DM 策略由 TELEGRAM_DM_POLICY 控制（open / allowlist / disabled / pairing）。
 #   默认行为就是「配对」；我们不改它，只走一次性的 approve（比 open 更安全，比 allowlist 省事）。
-#   若日后想彻底免配对（不建议，等同放开所有人），可设 WEIXIN_DM_POLICY=open 后重启网关。
+#   若日后想彻底免配对（不建议，等同放开所有人），可设 TELEGRAM_DM_POLICY=open 后重启网关。
 ```
 
 ### ② 💬 对用户说（可原样发送）
 
-> 💬 Hermes 装好了，现在绑定微信。我马上把**二维码**发给你，请：
+> 💬 Hermes 装好了，现在绑定 Telegram。请：
 >
-> 1. 用**手机微信扫码**；2. 手机上点**确认登录**；3. 扫完跟我说一声。
->
-> 两点说明：
->
-> - 二维码有效期约 3 分钟，过期我重新生成一张；
-> - 绑好后**私聊**可用；**普通微信群消息可能收不到**（iLink 的限制，不是故障）。
->
-> 绑定完成后，请你**在微信里先给机器人发一条消息**。注意：第一次它**不会回内容**，只会回一个**8 位配对码**（比如 `3TNTE7PR`）——这是它的安全机制，不是坏了。
->
-> 请把这个**配对码发给我**，我批准一下；批准后再给它发一次消息，这次就有正常回复了。
+> 1. 找 **@BotFather** 新建一个 Bot（`/newbot`，起个名字），拿到它给你的 **Token**，**走安全页面**发我；
+> 2. 我验证通过后，请你**在 Telegram 里给这个 Bot 发一条消息**（随便发什么，比如 `/start`），告诉我一声；
+> 3. 它第一次**不会回内容**，只会回一个**8 位配对码**（比如 `3TNTE7PR`）——这是安全机制，不是坏了，把这个码发给我，我批准后你再发一次，这次就有正常回复了。
 
 ### ③ 🙋 用户手动做
 
-- 扫码 + 手机确认登录。
-- 在微信里给机器人发一条消息，把收到的 **8 位配对码**发给 AI。
-- 等 AI 批准后，再发一次消息确认有回复。
+- 用 @BotFather 建 Bot，经安全页面把 Token 发给 AI。
+- 给自己的 Bot 发一条消息，告诉 AI 已发送。
+- 把机器人回的 **8 位配对码**发给 AI；等批准后再发一次消息确认有回复。
 
 ### ④ ✅ 做完的标志
 
 ```bash
-compgen -G "$HOME/.hermes/weixin/accounts/*.json" >/dev/null && echo "账号已绑定"
-python3 -c "import glob,os;print([os.path.basename(p) for p in glob.glob(os.path.expanduser('~/.hermes/weixin/accounts/*.json'))])"
+compgen -G "$HOME/.hermes/telegram/accounts/*.json" >/dev/null && echo "账号已绑定"
+python3 -c "import glob,os;print([os.path.basename(p) for p in glob.glob(os.path.expanduser('~/.hermes/telegram/accounts/*.json'))])"
 pgrep -f "hermes-agent.*[g]ateway" >/dev/null && echo "网关运行中"
-grep -c '^WEIXIN_TOKEN=' ~/.hermes/.env     # 期望 1（只数条数，不看值）
-hermes pairing list                          # 期望：用户已在「已批准」列表里
+grep -c '^TELEGRAM_CHAT_ID=' ~/.hermes/.env     # 期望 1（只数条数，不看值）
+hermes pairing list                              # 期望：用户已在「已批准」列表里
 ```
 
-判据：账号 json 存在 + 网关进程在 + `.env` 里有 `WEIXIN_TOKEN` + **用户已在 pairing 已批准列表** + **用户确认收到机器人正常回复**（不是配对码）。
+判据：账号 json 存在 + 网关进程在 + `.env` 里有 `TELEGRAM_CHAT_ID` + **用户已在 pairing 已批准列表** + **用户确认收到机器人正常回复**（不是配对码）。
 
 ### ⑤ 🛠️ 常见失败与处理
 
-| 现象                                  | 原因                                        | 处理                                                                                               |
-| ------------------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `ModuleNotFoundError: qrcode`         | 没装依赖                                    | `python3 -m pip install "qrcode[pil]"`                                                             |
-| 二维码过期                            | 用户扫得太慢                                | 重跑 `weixin-qr-fetch.py` 生成新码（`confirm` 脚本会返回 2=expired）                               |
-| 扫码后无反应                          | 网络问题                                    | 看 `~/.hermes/logs/weixin-gateway.log` 尾部；确认沙盒能访问 iLink 域名                             |
-| 能收不能回 / 回复全失败               | `state.db` 被换过（`StateDbReplacedError`） | 停网关 → 让恢复脚本用本手册版本重跑 → 重新起网关（**不要在网关运行时覆盖 `~/.hermes/` 里的数据**） |
-| 机器人只回配对码、不回内容            | 首次私聊未配对（Hermes 默认配对）           | 让用户把配对码发来，`hermes pairing approve weixin <配对码>`；批准后再发消息即可                   |
-| `hermes pairing list` 为空            | 用户还没发过消息 / 网关没连上               | 让用户先给机器人发一条消息，等它回配对码；确认网关在跑                                             |
-| 群里收不到消息                        | iLink 机器人限制                            | 如实说明：私聊可用，群聊可能收不到，不是配置问题                                                   |
-| `hermes send` 报 Weixin token missing | `.env` 里缺 `WEIXIN_TOKEN`                  | 按 ① 的第 5 步补写（网关自身读的是账号 json，所以机器人能收消息但 `hermes send` 会失败）           |
+| 现象                                      | 原因                                        | 处理                                                                                               |
+| ----------------------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `getMe` 返回 401 / `Unauthorized`         | Token 错误或已被 BotFather 吊销             | 让用户在 @BotFather 里 `/token` 重新生成一个                                                        |
+| `telegram-bot-confirm.py` 180 秒超时      | 用户没给 Bot 发消息，或发错了 Bot            | 确认用户发消息的对象是 `getMe` 返回的那个 `@username`                                              |
+| 能收不能回 / 回复全失败                   | `state.db` 被换过（`StateDbReplacedError`） | 停网关 → 让恢复脚本用本手册版本重跑 → 重新起网关（**不要在网关运行时覆盖 `~/.hermes/` 里的数据**） |
+| 机器人只回配对码、不回内容                | 首次私聊未配对（Hermes 默认配对）           | 让用户把配对码发来，`hermes pairing approve telegram <配对码>`；批准后再发消息即可                 |
+| `hermes pairing list` 为空                | 用户还没发过消息 / 网关没连上               | 让用户先给机器人发一条消息，等它回配对码；确认网关在跑                                             |
+| 长轮询反复 `ConnectError`                 | 出网代理掐长连接（国内机房常见）            | 网关自己会重试；看门狗/hook 探针只在进程彻底消失时才重启，短暂重连抖动不是故障                     |
+| Telegram 回复出现 shim 的 selftest 文案   | config.yaml 里把 `model.default` 误配成 `muse-bridge-selftest` | 改回 `muse-bridge-model`（任意非 selftest 的字符串都行，shim 只认请求头/消息前缀，不认 model 名） |
 
-### 代码 10/13：`weixin-qr-fetch.py`（取二维码）
+### 代码 10/13：`muse-bridge-shim.py`（本地模型桥接：OpenAI 兼容 shim + 落盘队列）
 
-**目标路径**：`~/workspace/setup/weixin-qr-fetch.py`
+**目标路径**：`~/workspace/setup/muse-bridge-shim.py`　**权限**：`chmod +x`
 
 ```python
 #!/usr/bin/env python3
-"""取微信（iLink）登录二维码并渲染成 PNG，供用户扫码。
+"""muse-bridge-shim.py — 本地模型桥接 shim（纯标准库，零外部依赖）。
+
+对外伪装成 OpenAI 兼容的 /v1/chat/completions，监听 127.0.0.1:18080（只听本机，不对外）。
+
+路由规则：
+  1. Authorization: Bearer <MUSE_BRIDGE_TOKEN> 不对 -> 401。
+  2. model == "muse-bridge-selftest" -> 立即返回固定文案，不进队列（部署期自检用，见步骤 9）。
+  3. 最后一条 user 消息以 "!hermes" 开头 -> 逃生舱：剥掉前缀，透传给
+     ~/.hermes/muse-bridge/bridge-config.json 里配置的可选上游模型；未配置则返回明确错误。
+  4. 请求头 X-Muse-Channel: telegram -> 主链路：落盘到队列 queue/pending/<key>.json，
+     长轮询 queue/done/<key>.json 直到有结果或超时。
+  5. 其它（没有 telegram header、也不是 !hermes、也不是 selftest，比如 `hermes chat` CLI）
+     -> 同样尝试走可选上游透传；未配置上游则返回明确错误（设计如此：默认不接外部模型，
+     CLI 直连在没配逃生舱时本来就不可用，见模块 D 的说明）。
+
+幂等：key = sha256(channel + 完整 messages 数组的 JSON)。重复请求（Hermes 重试/原样重发）
+命中同一个 key，若 done/ 里已有结果，直接返回（不重新排队、不重复唤醒 Agent）。
+
+队列目录（均在持久卷 $HOME 下）：
+  ~/.hermes/muse-bridge/queue/pending/<key>.json   认领方（hook 唤醒的 Agent）待处理
+  ~/.hermes/muse-bridge/queue/claimed/<key>.json   认领方正在处理（防止被探针重复判定为"待处理"）
+  ~/.hermes/muse-bridge/queue/done/<key>.json      认领方写完的结果，shim 读完即可留存（供幂等重放）
+"""
+import hashlib
+import json
+import os
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = os.path.expanduser("~")
+BRIDGE_DIR = os.path.join(HOME, ".hermes", "muse-bridge")
+QUEUE_DIR = os.path.join(BRIDGE_DIR, "queue")
+PENDING, CLAIMED, DONE = (os.path.join(QUEUE_DIR, d) for d in ("pending", "claimed", "done"))
+ENV_PATH = os.path.join(HOME, ".hermes", ".env")
+BRIDGE_CONFIG_PATH = os.path.join(BRIDGE_DIR, "bridge-config.json")
+PORT = 18080
+LONGPOLL_SEC = int(os.environ.get("MUSE_BRIDGE_LONGPOLL_SEC", "170"))
+POLL_INTERVAL = 1.0
+
+for d in (PENDING, CLAIMED, DONE):
+    os.makedirs(d, exist_ok=True)
+
+
+def load_env() -> dict:
+    out = {}
+    if os.path.exists(ENV_PATH):
+        for line in open(ENV_PATH):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k] = v
+    return out
+
+
+def load_bridge_config() -> dict:
+    if os.path.exists(BRIDGE_CONFIG_PATH):
+        try:
+            return json.load(open(BRIDGE_CONFIG_PATH))
+        except Exception:
+            return {}
+    return {}
+
+
+def idempotency_key(channel: str, messages: list) -> str:
+    h = hashlib.sha256()
+    h.update(channel.encode())
+    h.update(json.dumps(messages, sort_keys=True, ensure_ascii=False).encode())
+    return h.hexdigest()[:32]
+
+
+def selftest_response() -> dict:
+    return {
+        "id": "muse-bridge-selftest",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "muse-bridge selftest ok"},
+            "finish_reason": "stop",
+        }],
+    }
+
+
+def error_response(message: str) -> dict:
+    return {
+        "id": "muse-bridge-error",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": f"[muse-bridge] {message}"},
+            "finish_reason": "stop",
+        }],
+    }
+
+
+def passthrough(messages: list, stripped_first: bool) -> dict:
+    cfg = load_bridge_config()
+    base_url = cfg.get("upstream_base_url")
+    model = cfg.get("upstream_model")
+    key_env = cfg.get("upstream_key_env")
+    if not (base_url and model and key_env):
+        return error_response(
+            "未配置可选的上游模型（逃生舱/非 Telegram 直连），这是默认设计——"
+            "主链路不需要外部模型。要启用见模块 D 步骤 9 ⑥「进阶：逃生舱」。"
+        )
+    env = load_env()
+    api_key = env.get(key_env, "")
+    import urllib.request
+    body = json.dumps({"model": model, "messages": messages}).encode()
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        return error_response(f"上游透传失败：{exc}")
+
+
+def enqueue_and_wait(key: str, channel: str, messages: list) -> dict:
+    done_path = os.path.join(DONE, f"{key}.json")
+    if os.path.exists(done_path):
+        return json.load(open(done_path))  # 幂等重放：已有结果直接返回
+    pending_path = os.path.join(PENDING, f"{key}.json")
+    claimed_path = os.path.join(CLAIMED, f"{key}.json")
+    if not (os.path.exists(pending_path) or os.path.exists(claimed_path)):
+        tmp = pending_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({
+                "key": key, "channel": channel, "messages": messages,
+                "enqueued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }, f)
+        os.replace(tmp, pending_path)
+    deadline = time.monotonic() + LONGPOLL_SEC
+    while time.monotonic() < deadline:
+        if os.path.exists(done_path):
+            return json.load(open(done_path))
+        time.sleep(POLL_INTERVAL)
+    return error_response(
+        "认领方（hook 探针唤醒的 Agent）还没处理完，已超时返回；"
+        "Hermes 若重试会用同一个幂等 key 命中已有进度，不会重复排队。"
+    )
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # 日志走标准输出 -> 被 nohup 重定向到 shim.log
+        print("[shim] " + (fmt % args))
+
+    def _send_json(self, code: int, payload: dict):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.startswith("/v1/models"):
+            self._send_json(200, {"data": [{"id": "muse-bridge-model", "object": "model"}]})
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self.path.startswith("/v1/chat/completions"):
+            self._send_json(404, {"error": "not found"})
+            return
+        env = load_env()
+        expected = env.get("MUSE_BRIDGE_TOKEN", "")
+        auth = self.headers.get("Authorization", "")
+        if not expected or auth != f"Bearer {expected}":
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            self._send_json(400, {"error": "bad json"})
+            return
+        model = payload.get("model", "")
+        messages = payload.get("messages", [])
+        if model == "muse-bridge-selftest":
+            self._send_json(200, selftest_response())
+            return
+        last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+        if isinstance(last_user, str) and last_user.startswith("!hermes"):
+            messages = [dict(m) for m in messages]
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    m["content"] = last_user[len("!hermes"):].lstrip()
+                    break
+            self._send_json(200, passthrough(messages, stripped_first=True))
+            return
+        channel = self.headers.get("X-Muse-Channel", "")
+        if channel != "telegram":
+            self._send_json(200, passthrough(messages, stripped_first=False))
+            return
+        key = idempotency_key(channel, messages)
+        self._send_json(200, enqueue_and_wait(key, channel, messages))
+
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"[shim] listening on 127.0.0.1:{PORT}, longpoll={LONGPOLL_SEC}s")
+    server.serve_forever()
+```
+
+### 代码 11/13：`telegram-bot-verify.py` / `telegram-bot-confirm.py`（Telegram Bot 验证与绑定）
+
+**目标路径**：`~/workspace/setup/telegram-bot-verify.py`
+
+```python
+#!/usr/bin/env python3
+"""验证 Telegram Bot Token（调用 getMe），把 Token 暂存供 confirm 脚本续用。
 
 用法：
-    python3 weixin-qr-fetch.py
+    TELEGRAM_BOT_TOKEN=<token> python3 telegram-bot-verify.py
 产物：
-    $HOME/workspace/your_files/weixin-login-qr.png   ← 把这个 PNG 发给用户扫
-    $HOME/workspace/setup/weixin-qr-state.json       ← 供 weixin-qr-confirm.py 续用
-
-依赖：python3 + qrcode（含 PIL）
-    没有的话先装：python3 -m pip install "qrcode[pil]"
-    或：uv pip install --python "$(command -v python3)" "qrcode[pil]"
+    $HOME/.hermes/muse-bridge/.tg-token（600）—— 供 telegram-bot-confirm.py 读取，确认完成后应删除
 """
 import json
 import os
 import subprocess
 import sys
 
-try:
-    import qrcode
-except ImportError:  # 给出可执行的提示，别只抛 ModuleNotFoundError
-    print('缺少 qrcode 模块。请先执行: python3 -m pip install "qrcode[pil]"', file=sys.stderr)
-    sys.exit(4)
-
 HOME = os.path.expanduser("~")
-BASE_URL = "https://ilinkai.weixin.qq.com"
-APP_ID = "bot"
-CLIENT_VERSION = str((2 << 16) | (2 << 8) | 0)
-STATE_PATH = os.path.join(HOME, "workspace", "setup", "weixin-qr-state.json")
-PNG_PATH = os.path.join(HOME, "workspace", "your_files", "weixin-login-qr.png")
-
-
-def api_get(endpoint: str) -> dict:
-    out = subprocess.run(
-        [
-            "curl", "-s", "-m", "30",
-            "-H", f"iLink-App-Id: {APP_ID}",
-            "-H", f"iLink-App-ClientVersion: {CLIENT_VERSION}",
-            f"{BASE_URL}/{endpoint}",
-        ],
-        capture_output=True, text=True, check=True,
-    )
-    return json.loads(out.stdout)
+TOKEN_PATH = os.path.join(HOME, ".hermes", "muse-bridge", ".tg-token")
 
 
 def main() -> int:
-    data = api_get("ilink/bot/get_bot_qrcode?bot_type=3")
-    qrcode_value = str(data.get("qrcode") or "")
-    qrcode_url = str(data.get("qrcode_img_content") or "")
-    if not qrcode_value:
-        print(f"QR response missing qrcode: {data}", file=sys.stderr)
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        print("缺少环境变量 TELEGRAM_BOT_TOKEN", file=sys.stderr)
+        return 4
+    out = subprocess.run(
+        ["curl", "-s", "-m", "20", f"https://api.telegram.org/bot{token}/getMe"],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(out.stdout)
+    if not data.get("ok"):
+        print(f"getMe 失败: {data}", file=sys.stderr)
         return 1
-    scan_target = qrcode_url or qrcode_value
-    os.makedirs(os.path.dirname(PNG_PATH), exist_ok=True)
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    qr = qrcode.QRCode(box_size=10, border=4)
-    qr.add_data(scan_target)
-    qr.make(fit=True)
-    qr.make_image(fill_color="black", back_color="white").save(PNG_PATH)
-    with open(STATE_PATH, "w") as f:
-        json.dump({"qrcode": qrcode_value, "qrcode_url": qrcode_url}, f)
-    os.chmod(STATE_PATH, 0o600)
-    print(f"QR saved: {PNG_PATH}")
-    print("下一步：把这个 PNG 发给用户扫，然后跑 weixin-qr-confirm.py 等确认（180 秒内）")
+    username = data["result"]["username"]
+    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+    with open(TOKEN_PATH, "w") as f:
+        f.write(token)
+    os.chmod(TOKEN_PATH, 0o600)
+    print(f"Bot verified: @{username}")
+    print("下一步：请用户给这个 Bot 发一条消息，然后跑 telegram-bot-confirm.py")
     return 0
 
 
@@ -2001,21 +2269,19 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-### 代码 11/13：`weixin-qr-confirm.py`（轮询确认并落盘凭据）
-
-**目标路径**：`~/workspace/setup/weixin-qr-confirm.py`
+**目标路径**：`~/workspace/setup/telegram-bot-confirm.py`
 
 ```python
 #!/usr/bin/env python3
-"""轮询 iLink 二维码状态，用户确认后把微信账号凭据落盘到 ~/.hermes/weixin/accounts/。
+"""轮询 getUpdates，用户给 Bot 发消息后落盘账号凭据到 ~/.hermes/telegram/accounts/。
 
 用法：
-    python3 weixin-qr-confirm.py        # 需先跑 weixin-qr-fetch.py 生成 state 文件
+    python3 telegram-bot-confirm.py        # 需先跑 telegram-bot-verify.py 生成 .tg-token
 退出码：
-    0=已确认并落盘  1=凭据不完整  2=二维码过期  3=180 秒超时  4=缺依赖/缺 state
+    0=已确认并落盘  1=未收到任何消息（超时）  4=缺 .tg-token
 
-落盘文件：$HOME/.hermes/weixin/accounts/<account_id>.json（600），
-内容 {"token", "base_url", "user_id", "saved_at"} —— Hermes 微信网关读的就是这个目录。
+落盘文件：$HOME/.hermes/telegram/accounts/<bot_username>.json（600），
+内容 {"token", "chat_id", "user_id", "saved_at"} —— Hermes telegram 网关读的就是这个目录。
 """
 import json
 import os
@@ -2024,77 +2290,55 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
-BASE_URL = "https://ilinkai.weixin.qq.com"
-APP_ID = "bot"
-CLIENT_VERSION = str((2 << 16) | (2 << 8) | 0)
-STATE_PATH = os.path.join(HOME, "workspace", "setup", "weixin-qr-state.json")
+TOKEN_PATH = os.path.join(HOME, ".hermes", "muse-bridge", ".tg-token")
 HERMES_HOME = os.path.join(HOME, ".hermes")
 
 
-def api_get(base: str, endpoint: str) -> dict:
+def api_get(token: str, endpoint: str) -> dict:
     out = subprocess.run(
-        [
-            "curl", "-s", "-m", "35",
-            "-H", f"iLink-App-Id: {APP_ID}",
-            "-H", f"iLink-App-ClientVersion: {CLIENT_VERSION}",
-            f"{base}/{endpoint}",
-        ],
+        ["curl", "-s", "-m", "35", f"https://api.telegram.org/bot{token}/{endpoint}"],
         capture_output=True, text=True, check=True,
     )
     return json.loads(out.stdout)
 
 
 def main() -> int:
-    if not os.path.exists(STATE_PATH):
-        print(f"缺少 {STATE_PATH}：请先跑 weixin-qr-fetch.py", file=sys.stderr)
+    if not os.path.exists(TOKEN_PATH):
+        print(f"缺少 {TOKEN_PATH}：请先跑 telegram-bot-verify.py", file=sys.stderr)
         return 4
-    with open(STATE_PATH) as f:
-        state = json.load(f)
-    qrcode = state["qrcode"]
-    base = BASE_URL
+    token = open(TOKEN_PATH).read().strip()
+    me = api_get(token, "getMe")
+    username = me["result"]["username"]
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
-        try:
-            resp = api_get(base, f"ilink/bot/get_qrcode_status?qrcode={qrcode}")
-        except Exception as exc:  # 网络抖动：继续轮询，别放弃
-            print(f"poll error: {exc}", file=sys.stderr)
-            time.sleep(2)
-            continue
-        status = str(resp.get("status") or "wait")
-        if status == "confirmed":
-            account_id = str(resp.get("ilink_bot_id") or "")
-            token = str(resp.get("bot_token") or "")
-            base_url = str(resp.get("baseurl") or base)
-            user_id = str(resp.get("ilink_user_id") or "")
-            if not account_id or not token:
-                print("confirmed but credential payload incomplete", file=sys.stderr)
-                return 1
-            acct_dir = os.path.join(HERMES_HOME, "weixin", "accounts")
-            os.makedirs(acct_dir, exist_ok=True)
-            path = os.path.join(acct_dir, f"{account_id}.json")
-            payload = {
-                "token": token,
-                "base_url": base_url.rstrip("/"),
-                "user_id": user_id,
-                "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(payload, f)
-            os.replace(tmp, path)   # 原子落盘，避免网关读到半个文件
-            os.chmod(path, 0o600)
-            print(f"OK account_id={account_id} user_id={user_id}")
-            print("下一步：把 WEIXIN_TOKEN / WEIXIN_ACCOUNT_ID 写进 ~/.hermes/.env，再启动网关")
-            return 0
-        if status == "expired":
-            print("QR expired before confirmation", file=sys.stderr)
-            return 2
-        if status == "scaned_but_redirect" and resp.get("redirect_host"):
-            base = f"https://{resp['redirect_host']}"
-        # wait / scaned -> 继续轮询
+        resp = api_get(token, "getUpdates?timeout=10")
+        results = resp.get("result", [])
+        if results:
+            msg = results[-1].get("message", {})
+            chat_id = msg.get("chat", {}).get("id")
+            user_id = msg.get("from", {}).get("id")
+            if chat_id is not None:
+                acct_dir = os.path.join(HERMES_HOME, "telegram", "accounts")
+                os.makedirs(acct_dir, exist_ok=True)
+                path = os.path.join(acct_dir, f"{username}.json")
+                payload = {
+                    "token": token,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(payload, f)
+                os.replace(tmp, path)   # 原子落盘，避免网关读到半个文件
+                os.chmod(path, 0o600)
+                os.remove(TOKEN_PATH)
+                print(f"OK bot=@{username} chat_id={chat_id}")
+                print("下一步：把 TELEGRAM_CHAT_ID / TELEGRAM_BOT_USERNAME 写进 ~/.hermes/.env，再启动网关")
+                return 0
         time.sleep(2)
-    print("timed out waiting for confirmation", file=sys.stderr)
-    return 3
+    print("timed out waiting for a message to the bot", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
@@ -2125,8 +2369,8 @@ tail -10 ~/workspace/setup/logs/watchdog.log
 
 ### ② 💬 对用户说（可原样发送）
 
-> 🐕 现在开第一层保活：沙盒自己的看门狗，每分钟检查探针、微信网关、SSH，挂了自动拉起。
-> 另外它还会看**微信连接是否卡死**——进程活着不等于连接活着，日志里持续报错超过 5 分钟就重启网关。
+> 🐕 现在开第一层保活：沙盒自己的看门狗，每分钟检查探针、Telegram 网关、muse-bridge shim、SSH，挂了自动拉起。
+> 另外它还会看**Telegram 长轮询是否卡死**——进程活着不等于连接活着，日志里持续报错超过 5 分钟就重启网关。
 > 你不用做任何事，我来配。
 
 ### ③ 🙋 用户手动做
@@ -2150,7 +2394,7 @@ test -d ~/workspace/setup/.watchdog.lock && echo "有锁残留（不正常）" |
 | `crontab: command not found` | 没装 cron                  | 见步骤 8 的离线包，`bash ~/workspace/setup/restore-all.sh` 会补装           |
 | 日志不再增长                 | cron 守护进程没跑          | `pgrep -f "[/]usr/sbin/cron"`；`service cron start`                         |
 | 出现两行 watchdog            | 用了 `crontab -e` 手工加过 | 先 `crontab -l \| grep -v watchdog.sh \| crontab -` 清干净，再按上面的幂等写法写 |
-| 看门狗反复重启网关           | 网关真的起不来             | 看 `~/.hermes/logs/weixin-gateway.log`，通常是账号凭据丢了或 state.db 异常  |
+| 看门狗反复重启网关           | 网关真的起不来             | 看 `~/.hermes/logs/telegram-gateway.log`，通常是账号凭据丢了或 state.db 异常  |
 | 锁目录残留导致跳过巡检       | 上一次被强杀               | 看门狗会自己校验 PID+cmdline 回收 stale 锁；若目录里没有 pid 文件则直接回收 |
 
 ## 十五、步骤 12：平台端授权（Layer 2 的前置动作）
@@ -2172,17 +2416,18 @@ ls -l /home/hatch/init.sh 2>/dev/null || echo "init.sh 尚未创建（步骤 14 
 
 ### ② 💬 对用户说（可原样发送）
 
-> 🔐 接下来要设平台级的保活（跑在沙盒外面的兜底），需要你在平台端确认三件事：
+> 🔐 接下来要设平台级的保活（跑在沙盒外面的兜底），需要你在平台端确认四件事：
 >
 > **1. 允许注册保活探针 hook**：我要注册一个每 10 秒运行的 hook 探针（名字 `keepalive-tripwire`），它独立于沙盒，重建也不会死。健康时它只跑一段 shell、不消耗模型额度；只在真出事时才唤醒 AI 做恢复。创建时如果弹授权卡片，请点**允许**。
-> **2. 允许注册开机钩子**：我要注册一个开机钩子（`home-init`），沙盒每次启动自动跑一次恢复。有权限提示请允许。
-> **3. 允许开机命令以 root 执行**：钩子入口 `init.sh` 需要 root 权限（chmod 700），它要装系统包、写 systemd、起 sshd。平台提示权限申请时请批准。
+> **2. 允许注册 muse-bridge 的队列探针**：我要再注册一个每 15 秒运行的 hook 探针（名字 `telegram-bridge-tripwire`），专门盯 Telegram 消息队列，有消息待处理才唤醒我。同样健康时零 token。
+> **3. 允许注册开机钩子**：我要注册一个开机钩子（`home-init`），沙盒每次启动自动跑一次恢复。有权限提示请允许。
+> **4. 允许开机命令以 root 执行**：钩子入口 `init.sh` 需要 root 权限（chmod 700），它要装系统包、写 systemd、起 sshd。平台提示权限申请时请批准。
 >
-> 三项都确认后跟我说"同意继续"。
+> 四项都确认后跟我说"同意继续"。
 
 ### ③ 🙋 用户手动做
 
-- 在平台端批准上面三项（保活探针 hook / 开机钩子 / root 执行）。
+- 在平台端批准上面四项（保活探针 hook / bridge 队列探针 hook / 开机钩子 / root 执行）。
 - 回复"同意继续"。
 
 ### ④ ✅ 做完的标志
@@ -2204,9 +2449,9 @@ touch /home/hatch/hooks/definitions/.write-test && rm -f /home/hatch/hooks/defin
 | hooks 目录不可写     | 权限/属主不对 | `ls -ld` 看属主；沙盒里通常是 root，必要时 `chown`（改系统层要跟用户报备） |
 | 用户说"没有授权卡片" | 平台直接放行  | 正常，继续；后面用"hook 真的注册上没有"来验证                               |
 
-## 十六、步骤 13：Layer 2a — 平台 hook 探针（检测/恢复拆分，真正的兜底）
+## 十六、步骤 13：Layer 2a — 平台 hook 探针（检测/恢复拆分，真正的兜底）+ 步骤 13b：muse-bridge 的 bridge-tripwire
 
-**目标**：沙盒外面每 10 秒做一次**零 token**健康检查，连续异常才唤醒 agent 跑恢复。
+**目标**：沙盒外面每 10 秒做一次**零 token**健康检查，连续异常才唤醒 agent 跑恢复；再装一个同类探针（`telegram-bridge-tripwire`，15 秒一轮）专门盯 muse-bridge 的队列，有待认领任务才唤醒你处理 Telegram 消息。
 
 > 设计要点：**检测与恢复拆开**。hook runtime 每 10 秒执行一段轻量 bash（不启动 LLM worker）；
 > 健康时调 `silent`，本轮零 token；只有 `wake` 才启动完整 worker 执行恢复。
@@ -2318,11 +2563,65 @@ bash -n ~/hooks/scripts/keepalive-tripwire.sh && echo "语法 OK"
   "enabled": false,
   "delivery": { "surface": "main" },
   "presentation_locale": "zh-CN",
-  "prompt": "你是沙盒保活的恢复执行员。hook 的轻量 bash 探针每 10 秒跑一次健康检查，平时它自己静默（零 token）；只在真出事时才把你叫醒，所以你每次被叫醒都要认真对待。\n\nwake 事件自带 reason 和 payload：\n- reason=restore_needed：health-check.sh 返回 1，疑似沙盒被重建，或 cf-probe / hermes 微信网关 / sshd / cron 关键服务挂了。\n- reason=unreachable：health-check.sh 连续 3 次无法执行或返回非 0/1（检查没跑起来），沙盒可能正在重建或 exec 通道异常。\n\n你的步骤：\n1. 先重跑 `bash ~/workspace/setup/health-check.sh` 确认当前状态（事件发生和你醒来之间情况可能已变）。\n2. 退出码 0：说明已恢复或为误报，直接结束。不要发消息，不要写日志。\n3. 退出码 1：后台执行 `bash ~/workspace/setup/restore-all.sh` 并等待完成（约 2 分钟，最多等 15 分钟；该脚本幂等，可安全重跑）。完成后重跑 `health-check.sh` 验证。只在异常/恢复时记日志：把\"检测到什么、是否恢复成功、各服务当前状态\"追加到当天 `~/memory/YYYY-MM-DD.md`。恢复成功后在当前聊天给用户发一条简短中文通知；恢复失败则告诉用户失败了、最后看到的错误是什么（看 `~/workspace/setup/logs/restore.log` 尾部），请用户指示下一步，不要反复重试。\n4. 退出码非 0/1 或 exec 不通：探针已经连续 3 次失败才叫醒你，重试一次 `health-check.sh`；仍不通则在当前聊天简短告诉用户沙盒可能失联、请指示下一步。\n\n铁律：\n- 绝不在任何消息、日志正文或回复中复述探针 API_SECRET（它在 `~/workspace/setup/install-cf-probe.sh`，600 权限）。\n- 不要编辑 `~/MEMORY.md`。\n- 只有\"触发了恢复\"或\"持续失联\"才打扰用户。"
+  "prompt": "你是沙盒保活的恢复执行员。hook 的轻量 bash 探针每 10 秒跑一次健康检查，平时它自己静默（零 token）；只在真出事时才把你叫醒，所以你每次被叫醒都要认真对待。\n\nwake 事件自带 reason 和 payload：\n- reason=restore_needed：health-check.sh 返回 1，疑似沙盒被重建，或 cf-probe / hermes telegram 网关 / muse-bridge shim / sshd / cron 关键服务挂了。\n- reason=unreachable：health-check.sh 连续 3 次无法执行或返回非 0/1（检查没跑起来），沙盒可能正在重建或 exec 通道异常。\n\n你的步骤：\n1. 先重跑 `bash ~/workspace/setup/health-check.sh` 确认当前状态（事件发生和你醒来之间情况可能已变）。\n2. 退出码 0：说明已恢复或为误报，直接结束。不要发消息，不要写日志。\n3. 退出码 1：后台执行 `bash ~/workspace/setup/restore-all.sh` 并等待完成（约 2 分钟，最多等 15 分钟；该脚本幂等，可安全重跑）。完成后重跑 `health-check.sh` 验证。只在异常/恢复时记日志：把\"检测到什么、是否恢复成功、各服务当前状态\"追加到当天 `~/memory/YYYY-MM-DD.md`。恢复成功后在当前聊天给用户发一条简短中文通知；恢复失败则告诉用户失败了、最后看到的错误是什么（看 `~/workspace/setup/logs/restore.log` 尾部），请用户指示下一步，不要反复重试。\n4. 退出码非 0/1 或 exec 不通：探针已经连续 3 次失败才叫醒你，重试一次 `health-check.sh`；仍不通则在当前聊天简短告诉用户沙盒可能失联、请指示下一步。\n\n铁律：\n- 绝不在任何消息、日志正文或回复中复述探针 API_SECRET（它在 `~/workspace/setup/install-cf-probe.sh`，600 权限）。\n- 不要编辑 `~/MEMORY.md`。\n- 只有\"触发了恢复\"或\"持续失联\"才打扰用户。"
 }
 ```
 
 **3) 恢复 worker prompt** 就是上面定义里的 `prompt` 字段：hook 健康时根本不唤醒 worker，连这段 prompt 都不会被读到；只有 `wake` 时才作为唤醒载荷交给平台侧的恢复执行员。
+
+**4) 第二个 hook：`telegram-bridge-tripwire`**（muse-bridge 的队列认领探针，装了模块 D 才需要这一步）：
+
+> 和 `keepalive-tripwire` 同一种拆分思路：检测脚本只做一件便宜的事——数一下 `queue/pending/` 下有几个文件——健康（没有待认领任务）就 `silent`，有任务就 `wake` 把队列里的内容当 payload 交给你去处理。轮询周期 **15 秒**（比保活探针稍松，因为延迟预算本来就有 1~2 分钟，不需要卡到 10 秒）。
+
+**目标路径**：`~/hooks/scripts/telegram-bridge-tripwire.sh`　**权限**：`chmod +x`
+
+```bash
+#!/usr/bin/env bash
+# telegram-bridge-tripwire.sh — muse-bridge 队列认领探针（hook polling script）。
+#
+# 检测只做一件便宜的事：数 queue/pending/ 下的文件数。0 个 -> silent；
+# ≥1 个 -> wake，把文件名列表和内容摘要当 payload 交给你，你来决策/指挥 Hermes。
+set -euo pipefail
+source "${HATCH_HOOK_RUNTIME:?}"
+
+BRIDGE_DIR="$HOME/.hermes/muse-bridge"
+PENDING_DIR="$BRIDGE_DIR/queue/pending"
+mkdir -p "$PENDING_DIR"
+
+jobs=()
+for f in "$PENDING_DIR"/*.json; do
+  [ -e "$f" ] || continue
+  jobs+=("$(basename "$f" .json)")
+done
+
+if [ "${#jobs[@]}" -eq 0 ]; then
+  silent "empty" '{"pending":0}'
+else
+  payload="$(jq -n --argjson n "${#jobs[@]}" --arg keys "${jobs[*]}" '{pending:$n, keys:$keys}' 2>/dev/null \
+    || printf '{"pending":%s}' "${#jobs[@]}")"
+  wake "pending_jobs" "$payload"
+fi
+```
+
+```bash
+chmod +x ~/hooks/scripts/telegram-bridge-tripwire.sh
+bash -n ~/hooks/scripts/telegram-bridge-tripwire.sh && echo "语法 OK"
+```
+
+**目标路径**：`~/hooks/definitions/telegram-bridge-tripwire.json`
+
+```json
+{
+  "id": "telegram-bridge-tripwire",
+  "script_path": "~/hooks/scripts/telegram-bridge-tripwire.sh",
+  "poll_interval_secs": 15,
+  "script_timeout_secs": 600,
+  "enabled": false,
+  "delivery": { "surface": "main" },
+  "presentation_locale": "zh-CN",
+  "prompt": "你是 Telegram 消息的处理员，也是这套系统里唯一的\"大脑\"——Hermes 只是你的手。探针每 15 秒检查一次 muse-bridge 队列（~/.hermes/muse-bridge/queue/pending/），平时静默零 token；payload.keys 列出了本轮待处理的任务 key（空格分隔）。\n\n对每个 key，按顺序处理：\n1. 读 `~/.hermes/muse-bridge/queue/pending/<key>.json`，取出 messages 数组（完整对话历史，可能含之前几轮的 tool_calls/tool 结果）。\n2. 把它 mv 到 `~/.hermes/muse-bridge/queue/claimed/<key>.json`（防止下一轮探针把它当成新任务重复唤醒）。\n3. 数一下 messages 里 role=tool 的消息有几条——这是当前已经跑了几轮工具调用。≥6 轮就不要再发 tool_calls 了，直接用你已有的信息收尾回复用户，并说明"已达到单轮工具调用上限"。\n4. 决策：\n   a. 你凭自己的能力（浏览器、文件、记忆、技能、已有信息）就能回答 -> 直接写最终答案。把 `{\"id\":\"<key>\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"<你的回复>\"},\"finish_reason\":\"stop\"}]}` 原子写入 `~/.hermes/muse-bridge/queue/done/<key>.json`（先写 .tmp 再 mv，避免 shim 读到半个文件）。\n   b. 需要 Hermes 用它的原生工具（terminal/read_file/skills 等）替你执行一步 -> 写一个 finish_reason=tool_calls 的响应：`{\"id\":\"<key>\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"<工具名>\",\"arguments\":\"<JSON 字符串参数>\"}}]},\"finish_reason\":\"tool_calls\"}]}`，同样原子写入 done/<key>.json。Hermes 执行完工具后会把结果拼回对话、发起新一轮请求，shim 会生成一个新的 key 再次唤醒你——这就是多轮循环，你不用自己管理轮次状态，只管数 role=tool 的条数。\n5. 写完 done/<key>.json 后，把 claimed/<key>.json 删掉（任务收尾，避免目录无限增长）。\n6. 全部 key 处理完后结束，不要额外给用户发消息——回复内容已经通过 shim 返回给 Hermes，由 Hermes 发到 Telegram，不需要你在当前主聊天再重复一遍。\n\n铁律：\n- done/<key>.json 必须是合法 JSON，结构照抄上面两种模板，否则 shim 解析失败、Hermes 会报错。\n- 绝不在 content 或 tool_calls 的 arguments 里写入任何密钥（.env 里的 Token/Key）。\n- 处理期间看到任务内容涉及危险操作（删库、转账等），按你一贯的安全判断正常走审慎流程，该拒绝就拒绝、该确认就在回复里跟用户确认，不因为这是自动化链路就降低标准。"
+}
+```
 
 ### ② 💬 对用户说（可原样发送）
 
@@ -2330,12 +2629,13 @@ bash -n ~/hooks/scripts/keepalive-tripwire.sh && echo "语法 OK"
 >
 > 跟旧版每分钟启动一个 AI 做巡检不同，这个探针平时只跑一段 shell，健康时零 token 消耗；
 > 检查返回 1（重建或服务挂掉）它**立即**唤醒 AI 跑恢复；只有检查本身没跑起来才需连续 3 次确认（约 30 秒）。恢复约 2 分钟，成功后才通知你；健康的时候完全静默，不打扰你。
-> 你这边只要确认 hook 注册上了就行，我继续。
+> 装了模块 D 的话还会再加一个同类探针 `telegram-bridge-tripwire`，每 15 秒看一眼 muse-bridge 有没有待处理的 Telegram 消息，有就唤醒我（不是平台侧的恢复执行员，是我）去回复；没有也是零 token 静默。
+> 你这边只要确认两个 hook 都注册上了就行，我继续。
 
 ### ③ 🙋 用户手动做
 
-- 如果平台要求，确认 hook 注册（点允许 / 在 hook 列表里看到 `keepalive-tripwire`）。
-- 分支验证通过后，把 hook 定义置为启用（`enabled=true`）。
+- 如果平台要求，确认两个 hook 的注册（点允许 / 在 hook 列表里看到 `keepalive-tripwire` 与 `telegram-bridge-tripwire`）。
+- 分支验证通过后，把两个 hook 定义都置为启用（`enabled=true`）。
 
 ### ④ ✅ 做完的标志
 
@@ -2348,11 +2648,14 @@ bash ~/workspace/setup/health-check.sh; echo "退出码=$?"     # 期望 0
 # 3) 平台 dry_run（真实 runtime）
 #    期望 decision=silent, reason=healthy, would_wake=false，耗时 < 1 秒
 # 4) 启用后核验
-#    hook 定义里 enabled=true、poll_interval_secs=10；~/hooks/logs/keepalive-tripwire.jsonl 开始追加 silent 记录
+#    keepalive-tripwire 定义里 enabled=true、poll_interval_secs=10；~/hooks/logs/keepalive-tripwire.jsonl 开始追加 silent 记录
+# 5) telegram-bridge-tripwire（装了模块 D 才做）：queue/pending 为空时核验
+bash ~/hooks/scripts/telegram-bridge-tripwire.sh 2>&1 | tail -3   # 本地直接跑（没有 HATCH_HOOK_RUNTIME 会报错，属预期，仅用于看逻辑）
+#    启用后核验：~/hooks/logs/telegram-bridge-tripwire.jsonl 每 15 秒追加 silent "empty" 记录
 ```
 
-判据：`health-check.sh` 返回 0 + 分支验证全过 + dry_run 通过 + 启用后日志里出现 `outcome=silent` 记录。
-**真正验证它活着**：看 `~/hooks/logs/keepalive-tripwire.jsonl` 是否每 10 秒追加记录 —— "定义存在"不等于"跑过了"，日志才算数。
+判据：`health-check.sh` 返回 0 + 分支验证全过 + dry_run 通过 + 两个 hook 启用后各自日志里都出现 `outcome=silent` 记录。
+**真正验证它活着**：看 `~/hooks/logs/keepalive-tripwire.jsonl` 与 `~/hooks/logs/telegram-bridge-tripwire.jsonl` 是否按各自周期追加记录 —— "定义存在"不等于"跑过了"，日志才算数。
 
 ### ⑤ 🛠️ 常见失败与处理
 
@@ -2364,6 +2667,8 @@ bash ~/workspace/setup/health-check.sh; echo "退出码=$?"     # 期望 0
 | 用户被反复打扰                                           | worker prompt 里"健康时静默"被漏掉              | prompt 原文照搬，别自己精简；注意 hook 健康时根本不唤醒 worker，连 prompt 都不会被读到                             |
 | 平台端没有 hook 机制                                     | 平台不支持                                      | **退化为旧方案**：每分钟 agent cron（`sandbox-keepalive-monitor`，定义见本步附录），并如实告知用户额度成本（约 1,434 万 input/天）；或至少保留"开机钩子 + 沙盒内看门狗"两层 |
 | `source "$HATCH_HOOK_RUNTIME"` 在 set -e 下直接退出       | 变量为空时 `set -u` 触发退出，连 `silent`/`wake` 都调不到 | 必须写成 `source "${HATCH_HOOK_RUNTIME:?}"`，并给 payload 组装加 jq 失败兜底（见上面脚本的 `build_payload`）        |
+| `telegram-bridge-tripwire` 唤醒了但 done/<key>.json 一直没出现 | 你（被唤醒的 Agent）处理超时或处理出错，没写完 done 文件 | shim 会在约 170 秒后对 Hermes 返回超时错误；排查你那边的处理逻辑是否卡住，claimed/ 下的文件是否还在 |
+| Telegram 迟迟没回复，但两个 hook 日志都正常               | 正常现象，不是故障                              | 架构本身有 1~2 分钟延迟（轮询周期 + 你作答时间），这是提前告知过用户的固有成本，不要误判成障碍去重启服务           |
 
 ### 附录：旧 cron 方案定义（仅用于"平台无 hook"时的退化）
 
@@ -2378,7 +2683,7 @@ bash ~/workspace/setup/health-check.sh; echo "退出码=$?"     # 期望 0
 
 1. 用 exec 运行 `bash ~/workspace/setup/health-check.sh`，看退出码。
 2. 退出码 0（健康）：什么都不做，不要给用户发任何消息，也不要写任何日志（健康轮静默）。
-3. 退出码 1（需要恢复：疑似沙盒被重建，或 cf-probe / hermes 微信网关 / sshd / cron 关键服务挂了）：
+3. 退出码 1（需要恢复：疑似沙盒被重建，或 cf-probe / hermes telegram 网关 / muse-bridge shim / sshd / cron 关键服务挂了）：
    a. 后台执行 `bash ~/workspace/setup/restore-all.sh` 并等待它完成（约 2 分钟，最多等 15 分钟）。该脚本幂等，可安全重跑。
    b. 完成后重跑 `health-check.sh` 验证。
    c. 恢复成功：在当前聊天给用户发一条简短中文通知，说明检测到了什么（如"沙盒被重建"还是"某服务挂了"）、已自动恢复、各服务当前状态。
@@ -2684,7 +2989,7 @@ for f in log/*.ndjson log/*.log; do [ -f "$f" ] && tail -c $((10 * 1024 * 1024))
 
 # 收尾｜验收、排障与运维（步骤 16–20）
 
-MuseAutoApprove 的验证、故障排查、与用户的交互纪律、升级卸载，最后跑一遍端到端验证与重建演练。**用户介入**：微信发消息测试、决定是否做重建演练。
+MuseAutoApprove 的验证、故障排查、与用户的交互纪律、升级卸载，最后跑一遍端到端验证与重建演练。**用户介入**：Telegram 发消息测试、决定是否做重建演练。
 
 ## 十九、步骤 16：验证是否可用
 
@@ -2949,14 +3254,20 @@ echo "=== 3. 探针 ==="
 systemctl is-active cf-probe
 journalctl -u cf-probe -n 3 --no-pager -o cat | tail -3
 
-echo "=== 4. 微信网关 ==="
+echo "=== 4. Telegram 网关 + muse-bridge ==="
 pgrep -f "hermes-agent.*[g]ateway" >/dev/null && echo "网关运行中"
-grep -c '^WEIXIN_TOKEN=' ~/.hermes/.env
+pgrep -f "[m]use-bridge-shim.py" >/dev/null && echo "muse-bridge shim 运行中"
+grep -c '^TELEGRAM_CHAT_ID=' ~/.hermes/.env
 hermes pairing list                              # 确认用户已在「已批准」列表（没有就走一次配对）
 
-echo "=== 5. 平台 hook 探针 ==="
-jq -e '.enabled == true and .poll_interval_secs == 10' ~/hooks/definitions/keepalive-tripwire.json >/dev/null && echo "探针已启用（10 秒）"
+echo "=== 5. 平台 hook 探针（保活 + muse-bridge 队列） ==="
+jq -e '.enabled == true and .poll_interval_secs == 10' ~/hooks/definitions/keepalive-tripwire.json >/dev/null && echo "keepalive 探针已启用（10 秒）"
 tail -n 3 ~/hooks/logs/keepalive-tripwire.jsonl 2>/dev/null || echo "（还没有日志，等十几秒）"
+jq -e '.enabled == true and .poll_interval_secs == 15' ~/hooks/definitions/telegram-bridge-tripwire.json >/dev/null && echo "bridge 探针已启用（15 秒）"
+tail -n 3 ~/hooks/logs/telegram-bridge-tripwire.jsonl 2>/dev/null || echo "（还没有日志，等十几秒）"
+
+echo "=== 5b. 平台是否更新过（对比构建时间） ==="
+hatch --version 2>/dev/null | grep -i built || echo "（非 hatch 平台或无此字段，跳过）"
 
 echo "=== 6. 开机钩子 ==="
 jq -e '.enabled == true' /home/hatch/hooks/definitions/home-init.json >/dev/null && echo "钩子已启用"
@@ -2986,19 +3297,22 @@ du -sh ~/workspace/backups/hermes-home
 
 > 🏁 都装好了，最后两步：
 >
-> 1. **请你用微信给机器人发一条"你好"**：如果它回的是**配对码**（8 位字符），把码发我，我批准后你再发一次；若直接回复了正常内容，就说明全链路通了。
-> 2. 要不要做一次**完整重建演练**？我会真跑一遍 `restore-all.sh`：微信网关会中断约 2 分钟，探针会短暂掉线，其他不受影响。跑完我把恢复耗时和每一步结果给你看。（建议做，这样"重建能恢复"就不是推测而是实测。）
+> 1. **请你用 Telegram 给机器人发一条"你好"**：如果它回的是**配对码**（8 位字符），把码发我，我批准后你再发一次；若直接回复了正常内容，就说明全链路通了。提醒一下：现在每条回复大概要等 1~2 分钟，这是架构固有延迟，不是卡住了。
+> 2. 要不要做一次**完整重建演练**？我会真跑一遍 `restore-all.sh`：Telegram 网关会中断约 2 分钟，探针会短暂掉线，其他不受影响。跑完我把恢复耗时和每一步结果给你看。（建议做，这样"重建能恢复"就不是推测而是实测。）
+>
+> 另外提醒一句：Worker `API_SECRET`、Telegram Bot Token 这些密钥目前只存在沙盒持久卷里——它由平台加密，万一控制面出问题解密密钥可能丢失。建议你自己也在密码管理器里留一份，不依赖这边的持久化。
 
 ### ③ 🙋 用户手动做
 
-- 微信发消息测试（若回配对码，把码发给 AI 批准后再发一次）。
+- Telegram 发消息测试（若回配对码，把码发给 AI 批准后再发一次）。
 - 决定是否做重建演练（做的话在旁边看着就行）。
+- （建议）自行备份一份关键密钥到密码管理器。
 
 ### ④ ✅ 做完的标志
 
-- 9 项检查全部符合期望（尤其 `health-check.sh` 退出码 0、微信有回复、MuseAutoApprove 守护进程在跑）。
-- 微信已配对：`hermes pairing list` 的已批准列表里有用户（微信里发消息有正常回复，不是配对码）。
-- 演练（若做）：`restore.log` 里从 `===== 开始恢复 =====` 到 `恢复结束` 有完整时间戳，恢复后重跑验证清单仍全绿，微信恢复对话。
+- 9 项检查全部符合期望（尤其 `health-check.sh` 退出码 0、Telegram 有回复、MuseAutoApprove 守护进程在跑）。
+- Telegram 已配对：`hermes pairing list` 的已批准列表里有用户（Telegram 里发消息有正常回复，不是配对码）。
+- 演练（若做）：`restore.log` 里从 `===== 开始恢复 =====` 到 `恢复结束` 有完整时间戳，恢复后重跑验证清单仍全绿，Telegram 恢复对话。
 
 ```bash
 grep -E '开始恢复|恢复结束' ~/workspace/setup/logs/restore.log | tail -4
@@ -3019,19 +3333,23 @@ bash ~/workspace/setup/health-check.sh; echo "演练后退出码=$?（期望 0�
 
 | 现象                              | 原因                       | 处理                                                                                              |
 | --------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------- |
-| 演练后微信不回                    | 网关没起来 / state.db 异常 | `tail -50 ~/.hermes/logs/weixin-gateway.log`；`bash ~/workspace/setup/restore-hermes.sh` 再跑一次 |
+| 演练后 Telegram 不回              | 网关没起来 / state.db 异常 | `tail -50 ~/.hermes/logs/telegram-gateway.log`；`bash ~/workspace/setup/restore-hermes.sh` 再跑一次 |
 | 演练后探针掉线不回来              | 探针安装失败（网络/缓存）  | 看 `logs/probe-install.log`；`bash ~/workspace/setup/cache-cf-probe-bin.sh` 补缓存后重跑启动器    |
 | 恢复日志里 `WARN hermes 恢复失败` | installer 下载失败且无缓存 | 联网重跑；确认 `~/workspace/setup/hermes-install.sh` 存在                                         |
 | `health-check.sh` 一直返回 1      | 有服务确实没起来           | 按输出里的 `failed: xxx` 逐个查                                                                   |
+| 演练后 muse-bridge shim 没起来     | watchdog/restore-all 的启动逻辑没跑到 | `pgrep -f "[m]use-bridge-shim.py"`；手动 `nohup python3 ~/workspace/setup/muse-bridge-shim.py >> ~/.hermes/muse-bridge/logs/shim.log 2>&1 &` |
 
 ## 二十四、运维手册（装完之后日常要用到的）
 
 ```bash
 # 查健康 / 手动恢复
 bash ~/workspace/setup/health-check.sh; echo $?      # 0=健康 1=需恢复
-bash ~/workspace/setup/restore-all.sh                # 幂等，可随时跑
+bash ~/workspace/setup/restore-all.sh                # 幂等，可随时跑；就是本手册的 restore.sh
 tail -f ~/workspace/setup/logs/restore.log
 tail -f ~/workspace/setup/logs/watchdog.log
+
+# 检测平台是否更新过（构建时间变了就是更新了，更新后不保证保留 /usr/local/bin、/etc 下的东西）
+hatch --version 2>/dev/null | grep -i built
 
 # 备份（手动，别加 cron）
 bash ~/workspace/setup/backup-hermes.sh; echo $?     # 0=成功；非 0=这次作废，上一份备份仍在
@@ -3043,10 +3361,16 @@ journalctl -u cf-probe -f
 bash ~/workspace/setup/run-probe-install.sh          # 重装探针（务必走启动器）
 bash ~/workspace/setup/cache-cf-probe-bin.sh         # 刷新二进制缓存
 
-# Hermes / 微信
+# Hermes / Telegram
 pgrep -f "hermes-agent.*[g]ateway" && echo 网关在跑
-tail -f ~/.hermes/logs/weixin-gateway.log
-hermes send --to weixin:<chat_id> "测试消息"          # 回合外主动发消息（需 .env 里有 WEIXIN_TOKEN）
+tail -f ~/.hermes/logs/telegram-gateway.log
+hermes send --to telegram:<chat_id> "测试消息"        # 回合外主动发消息（需 .env 里有 TELEGRAM_CHAT_ID）
+
+# muse-bridge（本地模型桥接：shim + 队列）
+pgrep -f "[m]use-bridge-shim.py" && echo "shim 在跑"
+tail -f ~/.hermes/muse-bridge/logs/shim.log
+ls ~/.hermes/muse-bridge/queue/pending/ ~/.hermes/muse-bridge/queue/claimed/   # 查有没有卡住的任务
+tail -n 3 ~/hooks/logs/telegram-bridge-tripwire.jsonl                          # 查 bridge 探针是否在跑
 
 # MuseAutoApprove（muse.ai 外联审批自动批准）
 APP=~/workspace/muse-guardian/MuseAutoApprove
@@ -3075,18 +3399,20 @@ rm -f "$APP/data/muse-daemon.stop"                     # 退出维护模式（�
 1. **绝不在网关运行时覆盖 `~/.hermes/` 里的数据文件。** `state.db` 一旦被换掉，运行中的网关会抛 `StateDbReplacedError` 并**拒绝一切写入**——症状是"能收消息、完全回不了"，而且看起来像网络问题。要动数据就先停网关（本手册的 `restore-hermes.sh` 只在真正需要时才停，且只在健康时跳过 installer）。
 2. **SQLite 必须用 `sqlite3 .backup` 在线热备，且失败要 fail closed。** `~/.hermes` 里有三个 WAL 活库（`state.db`、`kanban.db`、`shared-state.db`）；裸 `cp`/`rsync` 复制会撕裂（压测单轮最多静默丢 38000 行），而 `PRAGMA integrity_check` 对撕裂备份**照样返回 ok**——不要用 `integrity_check` 当验收手段。热备失败时**不要**回退到 cp，旧备份比"看起来新的坏备份"值钱。
 3. **探针安装必须走 `run-probe-install.sh`。** 安装器按 cmdline 关键字清理进程，直接跑会把调用者自己的 shell 杀掉。
-4. **判断微信账号存在用 `compgen -G`，不要用 `[ -f dir/*.json ]`。** 后者在 glob 展开成多个文件时直接报 `too many arguments`、分支恒为假，症状就是"重建后网关起不来"。
+4. **判断 Telegram 账号存在用 `compgen -G`，不要用 `[ -f dir/*.json ]`。** 后者在 glob 展开成多个文件时直接报 `too many arguments`、分支恒为假，症状就是"重建后网关起不来"。
 5. **`gateway.pid` 是 JSON，不是裸数字。** 想按 pid 精确 kill 就老老实实解析（`jq -r .pid` 或 python），别 `cat` 出来当数字用——否则那个分支永远命中不了，你以为在精确 kill，其实一直在走兜底。
 6. **密钥纪律**：严格按第二章规则 4（四条铁律）执行，MAA 的 muse.ai 密码例外见第六章。
 7. **备份脚本不要加进 cron。** 它读三个活库；手动/按需跑即可。
 8. **HEALTH CHECK 的退出码就是契约**：0 健康静默、1 需恢复（实现只返回 0/1；hook 探针对 rc=1 立即唤醒，非 0/1 累计连续 3 次才唤醒）。平台 hook 探针/看门狗都依赖它，改脚本时不要改变语义。
 9. **看门狗/巡检里杀进程要避开自己**：`pgrep -f "hermes-agent.*[g]ateway"` 用中括号，枚举后排除 `$$` 和 `$PPID`，不要 `pkill -f` 一把梭（命令行里出现过关键字的东西会被一起杀掉，包括调用者）。
-10. **本手册不含任何真实密钥、域名、IP。** 所有敏感值都是占位符：`<PROBE_ID>`、`<API_SECRET>`、`<WORKER_URL>`、`<API_BASE_URL>`、`<MODEL_NAME>`。部署时替换，替换后文件权限 600，并且**不要**把替换过的文件复制进任何文档/仓库。
+10. **本手册不含任何真实密钥、域名、IP。** 所有敏感值都是占位符：`<PROBE_ID>`、`<API_SECRET>`、`<WORKER_URL>`、`<TELEGRAM_BOT_TOKEN>`、`<TELEGRAM_CHAT_ID>`。部署时替换，替换后文件权限 600，并且**不要**把替换过的文件复制进任何文档/仓库。
 
 11. **MuseAutoApprove 的凭据按用户要求走明文聊天**：muse.ai 账号密码由用户在聊天框直接发给 AI，AI 落盘 `data/credentials.json`（600）后不回显、不复述、不进文档；其他入口（沙盒内自己写文件、安全页面）实测走不通。落盘后可提醒用户自行改密。详见第六章。
 12. **装 MuseAutoApprove 前必须让用户选策略**：默认 `allow_always`（永久放行）意味着"以后这个域名的外联不再问用户"。没有用户明确同意不要装；想保守就用 `--decision allow_once`。`deny_always` 不是"更安全的开关"——它会让沙盒对外请求全部失败。
 13. **不要对 app 目录用 `git clean -x` / `git clean -xdf`**：`data/`（凭据、会话）与 `log/` 都在 `.gitignore` 里，`-x` 会把它们当垃圾删掉，结果是"升级完要重新登录"。
 14. **网关存活检测用 `hermes-agent.*[g]ateway`，不要用 `[g]ateway run`。** 网关进程的 cmdline 有两种形态：直接 `hermes gateway run`，或经 `python3 -I -c` 包装（参数在脚本内部赋值，cmdline 里只剩 `hermes-agent` 路径，不含 `gateway run` 子串）。用 `[g]ateway run` 检测会在第二种形态下**每轮误判网关已死**，触发每分钟空转一次恢复流程（`restore-hermes` 报"网关启动后仍无进程"，但网关其实一直在跑）。`health-check.sh` / `watchdog.sh` / `restore-hermes.sh` 三处已统一为 `hermes-agent.*[g]ateway`——**改脚本时三处要一起改，别只改一处**。
+15. **muse-bridge 默认不接外部模型 API，这是设计选择不是未完成**：Hermes 的 `model.provider` 永远指向本地 shim（`127.0.0.1:18080`），回复由 hook 探针唤醒的 Agent（你自己）亲自决策，不是"等以后接上模型再用"。逃生舱（`!hermes` 前缀）与非 Telegram 直连都走**可选**的上游透传，不配置就应该明确报错，不要为了"看起来能用"而悄悄回退成别的行为。
+16. **持久卷不是防丢失的终极答案**：`$HOME` 由平台 LUKS 加密，控制面故障时解密密钥可能丢失，届时连"重建自动恢复"都救不了。每次生成/更换密钥（Worker `API_SECRET`、Telegram Bot Token、muse.ai 密码）后要提醒用户自己也留一份在密码管理器里，这不是可选礼貌，是第二章定的规则。
 
 ## 二十六、已知边界与待验证项（诚实清单）
 
@@ -3095,7 +3421,7 @@ rm -f "$APP/data/muse-daemon.stop"                     # 退出维护模式（�
 1. **`npx wrangler deploy` 是否能自动建 D1 库**：上游 README 的三条官方路径里都没写"先 `wrangler d1 create`"（绑定在 `wrangler.toml` 里声明了库名 `server-monitor-db`），但本地/CI 部署时通常需要库已存在。本手册的做法是**先查再建**（`d1 list` / `d1 create`，已存在会报错就忽略），三种情况下都不会错。**待在新账号上实测一次**：干净账号只跑 `npm run build:frontend && npx wrangler deploy` 会发生什么。
 2. **CF 后台「添加服务器」生成的安装命令里带了 `-ct / -cu / -cm` 网络质量节点**（中国大陆三网节点，第三方域名）。本手册的模板把这些做成可选占位符（留空即用 agent 内置节点）；**照抄后台命令**是最稳的做法。
 3. **Worker 的 Cron 触发器 / Durable Object 行为**：`wrangler.toml` 里声明了 `*/1 * * * *` 与 `0 * * * *` 两个 cron 和 `MetricsBroadcaster` DO；首次部署会自动创建 DO namespace（配置注释如此说）。上线后建议看一眼 Worker 的 Cron 日志确认定时任务在跑。
-4. **`weixin-qr-*.py` 用的是 iLink 的非公开接口**（`ilinkai.weixin.qq.com` 的 `ilink/bot/*`）。接口可能变更；脚本失败时先看返回体，再考虑是否需要调整参数（`bot_type=3`、App Id `bot`、客户端版本打包值）。
+4. **`telegram-bot-*.py` 用的是 Telegram 官方 Bot API**（`api.telegram.org/bot<token>/*`），属公开稳定接口，比原方案的逆向接口可靠；但 `getUpdates` 长轮询在国内机房出网不稳时仍可能抖动，脚本失败时先看返回体里的 `description` 字段。
 5. **平台侧的 hook/开机钩子接口随平台版本变化**：本手册给的是 Muse/hatch 上的实测形态（Layer 2a 探针定义与 Layer 2b 钩子定义都落在 `/home/hatch/hooks/definitions/`，探针日志在 `~/hooks/logs/`；退化方案的 cron 任务定义落盘在 `~/workspace/goals/goal/crons/minutely/`）。换平台时要重新确认"hook 怎么注册""开机命令叫什么"。
 6. **MuseAutoApprove 的自动登录假设"纯密码登录"**：服务端流程是 restart → send-otp（发验证码邮件）→ confirm-password（密码信封），**全程不读邮件**。若账号开了二步验证 / 新设备确认，`--smoke` 会失败——属于设计边界，需要现场确认账号策略（见第六章 ⑤）。
 7. **审批接口是逆向复刻的**：`egress.approvals` / `egress.approval.decide` 的请求形状来自对 muse.ai 网页客户端的抓包复刻，平台改版后会失效。症状：`rpc error`、决策字段不被识别、握手超时。处理：回仓库拉最新代码覆盖 `work/`（保留 `data/`），并把报错原文记录下来。
@@ -3105,5 +3431,7 @@ rm -f "$APP/data/muse-daemon.stop"                     # 退出维护模式（�
 11. **同一账号只在一处跑守护**：多处同时跑会重复轮询同一批审批单——先批的生效，后批的记 `decide_error`（无害但吵）。多沙盒场景要么各配各的账号，要么用 `MUSE_VM_ID` 明确分工。
 12. **「设置 → 权限 → 直接网络协议」的滑块点击无视觉反馈**：这是 Muse.AI 网页端的 Bug——点完滑块不动，但开关实际已经打开。不要据此反复点击，也不要判定为失败。这两处开工设置（直接网络协议 + 连接器 → 浏览器）都是平台网页端配置，沙盒内读不到，只能靠用户确认；间接判据是第三章探测 2 的连通性。
 13. **专属福利活动是官方的**：X 页面带认证（活动链接见第二十三章 ⑤ 专属福利），可以放心告知用户。
-14. **微信首次私聊会被 Hermes 的 DM 配对拦下**：机器人先回 8 位配对码，需 `hermes pairing approve weixin <码>` 批准（配对数据在 `~/.hermes/pairing/`，码 1 小时有效、每平台最多 3 个待批、批准后永久可用）。WEIXIN_DM_POLICY 可调（open/allowlist/disabled/pairing），本手册不放开策略，只做一次性 approve。见步骤 10 ① 第 7 条。
+14. **Telegram 首次私聊会被 Hermes 的 DM 配对拦下**：机器人先回 8 位配对码，需 `hermes pairing approve telegram <码>` 批准（配对数据在 `~/.hermes/pairing/`，码 1 小时有效、每平台最多 3 个待批、批准后永久可用）。TELEGRAM_DM_POLICY 可调（open/allowlist/disabled/pairing），本手册不放开策略，只做一次性 approve。见步骤 10 ① 第 6 条。
 15. **网关 cmdline 的两种形态**：`hermes gateway run` 与 `python3 -I -c` 包装（cmdline 里是 hermes-agent 路径）。存活性检测已统一用 `hermes-agent.*[g]ateway` 覆盖两种（见铁律 14）；换平台 / 换 Hermes 版本后若检测又出现误报，先 `cat /proc/<网关pid>/cmdline` 看实际形态，再决定是否调整模式。
+16. **`X-Muse-Channel` header 这种"适配器级 extra_headers"是本手册对 Hermes 配置能力的假设**，用来让 shim 区分"这条模型请求来自 Telegram 适配器"还是"来自 `hermes chat` CLI 或其它来源"。如果实际的 Hermes 版本不支持按 adapter 覆盖 headers，退化方案是：干脆只给 telegram 这一个 adapter 配置模型（即不给 CLI 配默认 provider），这样 CLI 直连在没配逃生舱时会直接报错而不是误传进队列——需要在目标 Hermes 版本上**现场确认**配置语法。
+17. **muse-bridge 的幂等 key 基于完整 messages 数组的哈希**：如果 Hermes 在工具调用结果之外，还会在重试时附带时间戳/随机 id 等易变字段，会导致同一轮对话被误判为"新请求"而重复排队/重复唤醒。部署后用步骤 20 最终验证清单的第 5 步观察几轮真实对话，确认没有这种误判；如果有，需要在 shim 的 `idempotency_key()` 里把易变字段过滤掉再哈希。
